@@ -1,0 +1,69 @@
+# 数据文件
+stock_price_vol_d.txt
+barra_Exposure(2).
+
+# 大型数据文件
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# 模型文件
+*.pt
+*.pth
+*.ckpt
+*.model
+*.weights
+
+# 日志文件
+*.log
+logs/
+tensorboard_logs/
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 配置文件（可能包含敏感信息）
+config.json
+.env 
