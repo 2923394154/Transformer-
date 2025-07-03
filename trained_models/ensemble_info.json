@@ -1,0 +1,78 @@
+{
+    "models": [
+        {
+            "model_id": 1,
+            "seed": 42,
+            "best_ic": 0.8352259398102415,
+            "config": {
+                "model_params": {
+                    "input_dim": 6,
+                    "d_model": 128,
+                    "nhead": 8,
+                    "num_layers": 3,
+                    "dim_feedforward": 512,
+                    "dropout": 0.1,
+                    "label_horizon": 10
+                },
+                "training_params": {
+                    "learning_rate": 0.0002,
+                    "weight_decay": 0.0001,
+                    "batch_size": 512,
+                    "num_epochs": 50
+                }
+            }
+        },
+        {
+            "model_id": 2,
+            "seed": 142,
+            "best_ic": 0.7900914487667221,
+            "config": {
+                "model_params": {
+                    "input_dim": 6,
+                    "d_model": 128,
+                    "nhead": 8,
+                    "num_layers": 3,
+                    "dim_feedforward": 512,
+                    "dropout": 0.1,
+                    "label_horizon": 10
+                },
+                "training_params": {
+                    "learning_rate": 0.0002,
+                    "weight_decay": 0.0001,
+                    "batch_size": 512,
+                    "num_epochs": 50
+                }
+            }
+        },
+        {
+            "model_id": 3,
+            "seed": 242,
+            "best_ic": 0.8149876164106453,
+            "config": {
+                "model_params": {
+                    "input_dim": 6,
+                    "d_model": 128,
+                    "nhead": 8,
+                    "num_layers": 3,
+                    "dim_feedforward": 512,
+                    "dropout": 0.1,
+                    "label_horizon": 10
+                },
+                "training_params": {
+                    "learning_rate": 0.0002,
+                    "weight_decay": 0.0001,
+                    "batch_size": 512,
+                    "num_epochs": 50
+                }
+            }
+        }
+    ],
+    "ensemble_type": "equal_weight",
+    "num_models": 3,
+    "seeds": [
+        42,
+        142,
+        242
+    ],
+    "training_date": "2025-07-03T16:50:20.363133"
+}

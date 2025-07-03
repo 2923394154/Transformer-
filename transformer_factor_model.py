@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 import pandas as pd
 import numpy as np
@@ -30,6 +31,7 @@ warnings.filterwarnings('ignore')
 import math
 import os
 from datetime import datetime, timedelta
+import psutil
 
 class FactorDataset(Dataset):
     """因子数据集类"""
@@ -91,18 +93,20 @@ class TransformerEncoder(nn.Module):
         # Positional Encoding
         self.pos_encoding = PositionalEncoding(d_model)
         
-        # Transformer Encoder Layers
+        # 优化的Transformer Encoder Layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=False  # (seq_len, batch_size, d_model)
+            batch_first=True,  # 改为batch_first提升性能
+            norm_first=True    # 预归一化，更稳定更快
         )
         
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, 
-            num_layers=num_layers
+            num_layers=num_layers,
+            enable_nested_tensor=False  # 禁用嵌套张量优化兼容性
         )
         
         # Output Layer
@@ -116,24 +120,28 @@ class TransformerEncoder(nn.Module):
             src_mask: 可选的掩码
         
         Returns:
-            output: (batch_size, 1) 预测的收益率
+            output: (batch_size,) 预测的收益率
         """
-        # 转换维度: (batch_size, seq_len, input_dim) -> (seq_len, batch_size, input_dim)
-        src = src.transpose(0, 1)
+        # 现在使用batch_first=True，不需要转换维度
+        # src: (batch_size, seq_len, input_dim)
         
         # Input Embedding
         src = self.input_embedding(src) * math.sqrt(self.d_model)
         
-        # Positional Encoding
-        src = self.pos_encoding(src)
+        # Positional Encoding - 适配batch_first
+        batch_size, seq_len, _ = src.shape
+        # self.pos_encoding.pe的形状是 (max_len, 1, d_model)
+        # 我们需要 (batch_size, seq_len, d_model)
+        pos_encoding = self.pos_encoding.pe[:seq_len, 0, :].unsqueeze(0).expand(batch_size, -1, -1)
+        src = src + pos_encoding
         src = self.dropout(src)
         
-        # Transformer Encoder
+        # Transformer Encoder (batch_first=True)
         output = self.transformer_encoder(src, src_mask)
         
         # 使用最后一个时间步的输出进行预测
-        # output: (seq_len, batch_size, d_model) -> (batch_size, d_model)
-        last_output = output[-1]
+        # output: (batch_size, seq_len, d_model) -> (batch_size, d_model)
+        last_output = output[:, -1, :]
         
         # Final prediction
         prediction = self.output_projection(last_output)  # (batch_size, 1)
@@ -170,6 +178,82 @@ def ic_loss(predictions, targets):
     # 返回IC的相反数作为损失
     return -ic
 
+def rank_ic_loss(predictions, targets):
+    """
+    Rank IC损失函数：基于排序的IC计算，对异常值更稳健
+    
+    Args:
+        predictions: 预测值 (batch_size,)
+        targets: 真实值 (batch_size,)
+    
+    Returns:
+        loss: -Rank IC值
+    """
+    # 计算排序
+    pred_ranks = torch.argsort(torch.argsort(predictions).float())
+    target_ranks = torch.argsort(torch.argsort(targets).float())
+    
+    # 计算Spearman相关系数（基于排序的相关）
+    pred_mean = torch.mean(pred_ranks)
+    target_mean = torch.mean(target_ranks)
+    
+    pred_centered = pred_ranks - pred_mean
+    target_centered = target_ranks - target_mean
+    
+    numerator = torch.sum(pred_centered * target_centered)
+    pred_std = torch.sqrt(torch.sum(pred_centered ** 2))
+    target_std = torch.sqrt(torch.sum(target_centered ** 2))
+    
+    denominator = pred_std * target_std + 1e-8
+    rank_ic = numerator / denominator
+    
+    return -rank_ic
+
+def mse_loss(predictions, targets):
+    """
+    均方误差损失：最基础但稳定的损失函数
+    """
+    return torch.mean((predictions - targets) ** 2)
+
+def huber_loss(predictions, targets, delta=1.0):
+    """
+    Huber损失：对异常值更稳健的损失函数
+    """
+    diff = torch.abs(predictions - targets)
+    return torch.where(diff < delta, 
+                      0.5 * diff ** 2, 
+                      delta * (diff - 0.5 * delta)).mean()
+
+def combined_loss(predictions, targets, alpha=0.7, beta=0.3):
+    """
+    组合损失：结合IC损失和MSE损失
+    
+    Args:
+        alpha: IC损失权重
+        beta: MSE损失权重
+    """
+    ic_l = ic_loss(predictions, targets)
+    mse_l = mse_loss(predictions, targets)
+    
+    # 归一化MSE损失到合适的尺度
+    mse_normalized = mse_l / (torch.var(targets) + 1e-8)
+    
+    return alpha * ic_l + beta * mse_normalized
+
+def directional_loss(predictions, targets):
+    """
+    方向损失：关注预测方向的正确性
+    """
+    # 将连续值转换为方向（正/负/零）
+    pred_direction = torch.sign(predictions)
+    target_direction = torch.sign(targets)
+    
+    # 计算方向一致性
+    correct_direction = (pred_direction * target_direction > 0).float()
+    
+    # 返回方向错误率
+    return 1.0 - torch.mean(correct_direction)
+
 class FactorTrainer:
     """因子训练器"""
     
@@ -182,7 +266,20 @@ class FactorTrainer:
         """
         self.config = model_config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"使用设备: {self.device}")
+        
+        # 损失函数选择
+        self.loss_type = model_config.get('loss_type', 'combined')  # 默认使用组合损失
+        self.loss_functions = {
+            'ic': ic_loss,
+            'rank_ic': rank_ic_loss,
+            'mse': mse_loss,
+            'huber': huber_loss,
+            'combined': combined_loss,
+            'directional': directional_loss
+        }
+        
+        # 显示详细的GPU信息
+        self._print_device_info()
         
         # 初始化模型
         self.model = TransformerEncoder(**model_config['model_params']).to(self.device)
@@ -194,15 +291,129 @@ class FactorTrainer:
             weight_decay=model_config.get('weight_decay', 1e-5)
         )
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.8, patience=5, verbose=True
+        # 优化的学习率调度器 - 余弦退火+重启
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
         )
+        
+        # 混合精度训练 - 只在GPU上启用
+        self.use_amp = self.device.type == 'cuda' and model_config.get('use_amp', True)
+        if self.use_amp:
+            self.scaler = GradScaler()
+            print("启用混合精度训练 (AMP)")
+        else:
+            self.scaler = None
+            if self.device.type == 'cuda':
+                print("混合精度训练已禁用")
         
         # 训练历史
         self.train_losses = []
         self.val_losses = []
         self.val_ics = []
+        
+    def _print_device_info(self):
+        """打印设备信息"""
+        print("=" * 60)
+        print("GPU加速信息")
+        print("=" * 60)
+        
+        if torch.cuda.is_available():
+            print(f"CUDA可用")
+            print(f"PyTorch版本: {torch.__version__}")
+            print(f"可用GPU数量: {torch.cuda.device_count()}")
+            
+            # 当前GPU信息
+            current_device = torch.cuda.current_device()
+            gpu_name = torch.cuda.get_device_name(current_device)
+            gpu_memory = torch.cuda.get_device_properties(current_device).total_memory / 1024**3
+            
+            print(f"使用GPU: {gpu_name}")
+            print(f"GPU显存: {gpu_memory:.1f} GB")
+            print(f"设备索引: cuda:{current_device}")
+            
+            # GPU内存使用情况
+            memory_allocated = torch.cuda.memory_allocated(current_device) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(current_device) / 1024**3
+            print(f"已分配显存: {memory_allocated:.2f} GB")
+            print(f"已预留显存: {memory_reserved:.2f} GB")
+            
+        else:
+            print("CUDA不可用，使用CPU训练")
+            print(f"CPU核心数: {psutil.cpu_count()}")
+            print(f"可用内存: {psutil.virtual_memory().available / 1024**3:.1f} GB")
+        
+        print("=" * 60)
+    
+    def _monitor_gpu_memory(self):
+        """监控GPU内存使用"""
+        if torch.cuda.is_available():
+            current_device = torch.cuda.current_device()
+            memory_allocated = torch.cuda.memory_allocated(current_device) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(current_device) / 1024**3
+            memory_total = torch.cuda.get_device_properties(current_device).total_memory / 1024**3
+            
+            print(f"GPU内存使用: {memory_allocated:.2f}GB / {memory_reserved:.2f}GB / {memory_total:.1f}GB")
+    
+    def _adjust_loss_function(self, epoch, current_ic):
+        """
+        根据训练情况动态调整损失函数
+        
+        Args:
+            epoch: 当前训练轮次
+            current_ic: 当前IC值
+        """
+        # 如果连续多轮IC为负，考虑切换损失函数
+        if len(self.val_ics) >= 5:
+            recent_ics = self.val_ics[-5:]
+            avg_recent_ic = sum(recent_ics) / len(recent_ics)
+            
+            # 如果最近5轮平均IC都小于-0.01，且当前使用IC损失
+            if avg_recent_ic < -0.01 and self.loss_type == 'ic':
+                print(f"\n检测到IC持续为负 (最近5轮平均: {avg_recent_ic:.4f})")
+                print("自动切换到组合损失函数以改善训练稳定性")
+                self.loss_type = 'combined'
+                return True
+            
+            # 如果使用组合损失后IC仍然很差，切换到MSE
+            elif avg_recent_ic < -0.02 and self.loss_type == 'combined':
+                print(f"\n组合损失效果不佳 (最近5轮平均: {avg_recent_ic:.4f})")
+                print("切换到MSE损失函数专注于预测准确性")
+                self.loss_type = 'mse'
+                return True
+            
+            # 如果MSE也不行，尝试Huber损失
+            elif avg_recent_ic < -0.015 and self.loss_type == 'mse' and epoch > 15:
+                print(f"\nMSE损失效果不佳 (最近5轮平均: {avg_recent_ic:.4f})")
+                print("切换到Huber损失函数处理异常值")
+                self.loss_type = 'huber'
+                return True
+        
+        return False
+    
+    def _check_and_fix_labels(self, predictions, targets):
+        """
+        检查并修正标签问题
+        
+        Args:
+            predictions: 模型预测值
+            targets: 真实标签
+        
+        Returns:
+            corrected_targets: 修正后的标签
+        """
+        # 计算当前IC
+        current_ic = np.corrcoef(predictions.detach().cpu().numpy(), 
+                               targets.detach().cpu().numpy())[0, 1]
+        
+        # 如果IC明显为负且接近-1，可能标签反向了
+        if current_ic < -0.5:
+            print(f"\n警告：检测到强负相关 (IC={current_ic:.4f})")
+            print("可能存在标签方向错误，建议检查收益率计算逻辑")
+            
+            # 可选：自动反转标签（谨慎使用）
+            # return -targets
+        
+        return targets
         
     def prepare_data(self, equal_volume_file='equal_volume_features_all.csv', 
                     stock_data_file='stock_price_vol_d.txt'):
@@ -243,9 +454,17 @@ class FactorTrainer:
         
         features, labels = processed_data
         
-        # 数据标准化
+        # 数据标准化（按特征维度标准化）
         scaler = StandardScaler()
         features_scaled = scaler.fit_transform(features)
+        
+        # 检查标签分布
+        print(f"标签统计信息:")
+        print(f"  均值: {labels.mean():.6f}")
+        print(f"  标准差: {labels.std():.6f}")
+        print(f"  最小值: {labels.min():.6f}")
+        print(f"  最大值: {labels.max():.6f}")
+        print(f"  正收益率占比: {(labels > 0).mean():.4f}")
         
         # 创建数据集
         dataset = FactorDataset(features_scaled, labels, seq_len=self.config['seq_len'])
@@ -257,19 +476,32 @@ class FactorTrainer:
         train_dataset = torch.utils.data.Subset(dataset, range(train_size))
         val_dataset = torch.utils.data.Subset(dataset, range(train_size, len(dataset)))
         
+        # 高性能数据加载器设置
+        num_workers = min(8, os.cpu_count() or 1) if torch.cuda.is_available() else 2
+        pin_memory = torch.cuda.is_available()
+        
+        print(f"数据加载器配置: num_workers={num_workers}, pin_memory={pin_memory}")
+        
         # 创建数据加载器
         train_loader = DataLoader(
             train_dataset, 
             batch_size=self.config['batch_size'], 
-            shuffle=False,  # 时间序列数据不shuffle
-            num_workers=2
+            shuffle=True,  # 适当shuffle提升泛化能力
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4,  # 预取更多批次
+            drop_last=True  # 保证批次大小一致
         )
         
         val_loader = DataLoader(
             val_dataset, 
-            batch_size=self.config['batch_size'], 
+            batch_size=self.config['batch_size'] * 2,  # 验证时用更大批次
             shuffle=False,
-            num_workers=2
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2
         )
         
         print(f"训练集大小: {len(train_dataset)}")
@@ -303,20 +535,32 @@ class FactorTrainer:
         features_list = []
         labels_list = []
         
-        # 按股票分组处理
-        for stock_id in features_df['StockID'].unique():
+        # 预筛选有效股票，减少循环次数
+        stock_counts_features = features_df['StockID'].value_counts()
+        stock_counts_prices = stock_data['StockID'].value_counts()
+        valid_stocks = []
+        
+        for stock_id in stock_counts_features.index:
+            if (stock_counts_features[stock_id] >= 50 and 
+                stock_counts_prices.get(stock_id, 0) >= 50):
+                valid_stocks.append(stock_id)
+        
+        # 限制处理的股票数量以加速训练
+        valid_stocks = valid_stocks[:500]  # 最多处理500只股票
+        print(f"有效股票数量: {len(valid_stocks)}")
+        
+        # 按股票分组处理（使用进度条）
+        for stock_id in tqdm(valid_stocks, desc="处理股票数据"):
             stock_features = features_df[features_df['StockID'] == stock_id].copy()
             stock_prices = stock_data[stock_data['StockID'] == stock_id].copy()
-            
-            if len(stock_features) < 50 or len(stock_prices) < 50:  # 数据量太少
-                continue
                 
             # 按日期排序
             stock_features = stock_features.sort_values('end_date')
             stock_prices = stock_prices.sort_values('date')
             
             # 计算未来10日收益率标签
-            stock_prices['future_return'] = stock_prices['close'].pct_change(10).shift(-10)
+            stock_prices['future_close'] = stock_prices['close'].shift(-10)
+            stock_prices['future_return'] = (stock_prices['future_close'] - stock_prices['close']) / stock_prices['close']
             
             # 对齐特征和标签的日期
             stock_features['date'] = pd.to_datetime(stock_features['end_date'])
@@ -363,24 +607,39 @@ class FactorTrainer:
         num_batches = 0
         
         for batch_features, batch_labels in tqdm(train_loader, desc="Training"):
-            batch_features = batch_features.to(self.device)
-            batch_labels = batch_labels.to(self.device)
+            batch_features = batch_features.to(self.device, non_blocking=True)
+            batch_labels = batch_labels.to(self.device, non_blocking=True)
             
             self.optimizer.zero_grad()
             
-            # 前向传播
-            predictions = self.model(batch_features)
-            
-            # 计算IC损失
-            loss = ic_loss(predictions, batch_labels)
-            
-            # 反向传播
-            loss.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            self.optimizer.step()
+            # 使用混合精度训练
+            if self.use_amp:
+                with autocast():
+                    predictions = self.model(batch_features)
+                    loss = self.loss_functions[self.loss_type](predictions, batch_labels)
+                
+                # 缩放损失并反向传播
+                self.scaler.scale(loss).backward()
+                
+                # 梯度裁剪
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # 更新参数
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # 标准精度训练
+                predictions = self.model(batch_features)
+                loss = self.loss_functions[self.loss_type](predictions, batch_labels)
+                
+                # 反向传播
+                loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
             
             total_loss += loss.item()
             num_batches += 1
@@ -398,11 +657,17 @@ class FactorTrainer:
         
         with torch.no_grad():
             for batch_features, batch_labels in val_loader:
-                batch_features = batch_features.to(self.device)
-                batch_labels = batch_labels.to(self.device)
+                batch_features = batch_features.to(self.device, non_blocking=True)
+                batch_labels = batch_labels.to(self.device, non_blocking=True)
                 
-                predictions = self.model(batch_features)
-                loss = ic_loss(predictions, batch_labels)
+                # 使用混合精度推理
+                if self.use_amp:
+                    with autocast():
+                        predictions = self.model(batch_features)
+                        loss = self.loss_functions[self.loss_type](predictions, batch_labels)
+                else:
+                    predictions = self.model(batch_features)
+                    loss = self.loss_functions[self.loss_type](predictions, batch_labels)
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -422,30 +687,60 @@ class FactorTrainer:
         print(f"开始训练，总共 {num_epochs} 个epochs")
         print(f"模型参数数量: {sum(p.numel() for p in self.model.parameters()):,}")
         
+        # 显示初始GPU内存使用情况
+        if torch.cuda.is_available():
+            self._monitor_gpu_memory()
+        
         best_val_ic = -float('inf')
         patience_counter = 0
         patience = 15
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
+            print("-" * 40)
             
             # 训练
             train_loss = self.train_epoch(train_loader)
             
-            # 验证
-            val_loss, val_ic = self.validate(val_loader)
+            # 优化验证频率：前期每轮验证，后期每2轮验证一次
+            should_validate = epoch < 20 or epoch % 2 == 0
             
-            # 更新学习率
-            self.scheduler.step(val_loss)
+            if should_validate:
+                # 验证
+                val_loss, val_ic = self.validate(val_loader)
+            else:
+                # 跳过验证，使用上一次的值
+                val_loss, val_ic = self.val_losses[-1] if self.val_losses else 0.0, self.val_ics[-1] if self.val_ics else 0.0
+            
+            # 更新学习率（余弦退火调度器）
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step()
+            new_lr = self.optimizer.param_groups[0]['lr']
             
             # 记录历史
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             self.val_ics.append(val_ic)
             
+            # 显示训练结果
             print(f"训练损失: {train_loss:.6f}")
             print(f"验证损失: {val_loss:.6f}")
             print(f"验证IC: {val_ic:.6f}")
+            print(f"学习率: {current_lr:.2e}")
+            print(f"当前损失函数: {self.loss_type}")
+            
+            if new_lr != current_lr:
+                print(f"学习率降低至: {new_lr:.2e}")
+            
+            # 动态调整损失函数
+            if self._adjust_loss_function(epoch, val_ic):
+                print(f"已切换损失函数至: {self.loss_type}")
+                # 重置早停计数器，给新损失函数一些机会
+                patience_counter = max(0, patience_counter - 3)
+            
+            # 显示GPU内存使用情况
+            if torch.cuda.is_available() and epoch % 5 == 0:
+                self._monitor_gpu_memory()
             
             # 保存最佳模型
             if val_ic > best_val_ic:
@@ -468,6 +763,11 @@ class FactorTrainer:
                 break
         
         print(f"\n训练完成！最佳验证IC: {best_val_ic:.6f}")
+        
+        # 最终GPU内存使用情况
+        if torch.cuda.is_available():
+            print("\n最终GPU内存使用情况:")
+            self._monitor_gpu_memory()
         
         # 绘制训练曲线
         self.plot_training_curves()
