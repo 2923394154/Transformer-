@@ -242,7 +242,7 @@ class OptimizedEqualVolumeKlineBuilder:
         
         return features
     
-    def analyze_multiple_stocks(self, stock_list=None, max_stocks=10, start_date=None):
+    def analyze_multiple_stocks(self, stock_list=None, max_stocks=100, start_date=None):
         """
         分析多只股票的等量K线 - 大幅优化版本
         
@@ -377,11 +377,11 @@ def main():
     print("\n重新生成特征文件模式（大幅优化版本）")
     print("-" * 40)
     
-    # 运行批量分析 - 使用全部历史数据
-    result = builder.analyze_multiple_stocks(
-        max_stocks=10,           # 减少到10只股票
-        start_date=None          # 使用全部历史数据
-    )
+            # 运行批量分析 - 使用全部历史数据
+        result = builder.analyze_multiple_stocks(
+            max_stocks=100,          # 增加到100只股票以满足因子测试要求
+            start_date=None          # 使用全部历史数据
+        )
     
     if result is not None:
         print(f"\n✓ 等量K线构建成功!")
