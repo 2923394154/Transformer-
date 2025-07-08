@@ -21,16 +21,18 @@ from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 
 class OptimizedEqualVolumeKlineBuilder:
-    def __init__(self, lookback_days=10, bar_num=10):
+    def __init__(self, lookback_days=5, bar_num=5, max_bars_per_stock=1000):
         """
         初始化优化版等量K线构建器
         
         Args:
-            lookback_days: 计算历史平均成交量的天数 (10天)
-            bar_num: 每个周期设定的等量K线数量 (10根)
+            lookback_days: 计算历史平均成交量的天数 (5天，减少计算量)
+            bar_num: 每个周期设定的等量K线数量 (5根，减少数据量)
+            max_bars_per_stock: 每只股票最大K线数量 (1000根，控制总数据量)
         """
         self.lookback_days = lookback_days
         self.bar_num = bar_num
+        self.max_bars_per_stock = max_bars_per_stock
         
     def load_data(self):
         """加载并预处理数据"""
@@ -208,14 +210,19 @@ class OptimizedEqualVolumeKlineBuilder:
                 'high': current_high,
                 'low': current_low,
                 'close': current_close,
-                'vwap': round(vwap, 4),
-                'amount': round(cumulative_amount, 2),
+                'vwap': round(float(vwap), 4) if vwap is not None else 0.0,
+                'amount': round(float(cumulative_amount), 2),
                 'volume': cumulative_volume,
                 'target_volume': volume_targets.iloc[-1] if len(volume_targets) > 0 else 0,
                 'is_incomplete': True
             }
             
             equal_volume_bars.append(bar_data)
+        
+        # 限制每只股票的K线数量
+        if len(equal_volume_bars) > self.max_bars_per_stock:
+            print(f"股票 {stock_id}: 生成 {len(equal_volume_bars)} 根K线，限制为 {self.max_bars_per_stock} 根")
+            equal_volume_bars = equal_volume_bars[-self.max_bars_per_stock:]  # 保留最新的K线
         
         result_df = pd.DataFrame(equal_volume_bars)
         print(f"成功构建 {len(result_df)} 根等量K线")
@@ -242,26 +249,33 @@ class OptimizedEqualVolumeKlineBuilder:
         
         return features
     
-    def analyze_multiple_stocks(self, stock_list=None, max_stocks=100, start_date=None):
+    def analyze_multiple_stocks(self, stock_list=None, max_stocks=500, start_date=None, sampling_interval=5):
         """
-        分析多只股票的等量K线 - 大幅优化版本
+        分析多只股票的等量K线 - 优化版本
         
         Args:
             stock_list: 指定的股票列表，None则自动选择
-            max_stocks: 最大分析股票数量 (10只)
+            max_stocks: 最大分析股票数量（None表示无限制）
             start_date: 开始日期，None则使用全部历史数据
+            sampling_interval: 采样间隔天数，默认5天
         """
         print("="*60)
-        print("等量K线批量构建和特征提取 - 大幅优化版本")
+        print("等量K线批量构建和特征提取 - 优化版本")
         print(f"时间范围: {'全部历史数据' if start_date is None else start_date + ' 至今'}")
+        print(f"股票数量限制: {max_stocks if max_stocks else '无限制'}")
         print("="*60)
+        
+        # 验证股票数量设置
+        if max_stocks is not None and max_stocks < 10:
+            print(f"⚠️  警告: 股票数量 {max_stocks} 过少，建议至少10只")
+            print("   过少的股票可能导致特征多样性不足")
         
         # 加载数据
         data = self.load_data()
         if data is None:
             return None
         
-        # 时间过滤 - 保持全部历史数据
+        # 时间过滤
         if start_date:
             data = data[data['date'] >= pd.to_datetime(start_date)]
             print(f"时间过滤后数据形状: {data.shape}")
@@ -279,18 +293,29 @@ class OptimizedEqualVolumeKlineBuilder:
             # 扁平化列名
             volume_stats.columns = ['StockID', 'count', 'vol_mean', 'vol_std', 'amount_mean']
             
-            # 筛选条件：至少200个交易日，成交量稳定
-            volume_stats = volume_stats[volume_stats['count'] >= 200]  
+            # 筛选条件：至少100个交易日，成交量稳定（降低要求以增加股票数量）
+            volume_stats = volume_stats[volume_stats['count'] >= 100]  
             volume_stats = volume_stats[volume_stats['vol_mean'] > 0]
             
             # 计算综合评分：成交量 * 成交金额 / 波动率
             volume_stats['score'] = (volume_stats['vol_mean'] * volume_stats['amount_mean']) / (volume_stats['vol_std'] + 1e-10)
-            volume_stats = volume_stats.sort_values(by=['score'], ascending=False)
+            volume_stats = volume_stats.sort_values(by='score', ascending=False)
             
-            stock_list = volume_stats.head(max_stocks)['StockID'].tolist()
+            # 应用股票数量限制
+            if max_stocks is not None:
+                stock_list = volume_stats.head(max_stocks)['StockID'].tolist()
+                print(f"✓ 按成交量综合评分选择前 {max_stocks} 只股票")
+            else:
+                stock_list = volume_stats['StockID'].tolist()
+                print(f"✓ 使用所有 {len(stock_list)} 只有效股票")
+        else:
+            # 如果指定了股票列表但仍需要应用数量限制
+            if max_stocks is not None and len(stock_list) > max_stocks:
+                stock_list = stock_list[:max_stocks]
+                print(f"✓ 应用股票数量限制: {len(stock_list)} → {max_stocks} 只")
         
         print(f"\n将分析以下股票: {stock_list}")
-        print(f"优化参数: 回看{self.lookback_days}天, 每周期{self.bar_num}根K线, 数据量减少约60%")
+        print(f"优化参数: 回看{self.lookback_days}天, 每周期{self.bar_num}根K线")
         
         all_features = []
         
@@ -334,6 +359,13 @@ class OptimizedEqualVolumeKlineBuilder:
         if all_features:
             combined_features = pd.concat(all_features, ignore_index=True)
             
+            # 新增：每只股票每5天采样一次
+            if sampling_interval > 1:
+                combined_features = combined_features.groupby('StockID').apply(
+                    lambda df: df.sort_values('end_date').iloc[::sampling_interval]
+                ).reset_index(drop=True)
+                print(f"✓ 采样间隔: 每{sampling_interval}天采样一次，剩余样本数: {len(combined_features)}")
+            
             # 保存合并结果到主目录
             combined_file = "equal_volume_features_all.csv"
             combined_features.to_csv(combined_file, index=False)
@@ -360,28 +392,31 @@ def main():
     print("优化版等量K线构建程序")
     print("=" * 60)
     print("大幅优化措施:")
-    print("✓ 历史回看天数: 20天 → 10天")
-    print("✓ 每周期K线数: 20根 → 10根") 
-    print("✓ 股票数量: 50只 → 10只")
-    print("✓ 时间范围: 保持全部历史数据")
-    print("✓ 预计数据量减少: ~60%")
+    print("✓ 历史回看天数: 20天 → 5天 (减少计算量)")
+    print("✓ 每周期K线数: 20根 → 5根 (减少数据量)") 
+    print("✓ 单股最大K线数: 1000根 (控制内存使用)")
+    print("✓ 股票数量: 500只 (保持覆盖范围)")
+    print("✓ 时间范围: 2017年至今")
+    print("✓ 预计单股数据量减少: ~75% (大幅提升训练速度)")
     print("✓ 修复算法逻辑错误")
     print("=" * 60)
     
     # 初始化构建器 - 使用大幅优化参数
     builder = OptimizedEqualVolumeKlineBuilder(
-        lookback_days=10,  # 10天历史平均
-        bar_num=10         # 每周期10根K线
+        lookback_days=5,    # 5天历史平均 (减少)
+        bar_num=5,          # 每周期5根K线 (减少)
+        max_bars_per_stock=1000  # 每只股票最大1000根K线
     )
     
     print("\n重新生成特征文件模式（大幅优化版本）")
     print("-" * 40)
     
-            # 运行批量分析 - 使用全部历史数据
-        result = builder.analyze_multiple_stocks(
-            max_stocks=100,          # 增加到100只股票以满足因子测试要求
-            start_date=None          # 使用全部历史数据
-        )
+    # 运行批量分析 - 只使用2017年及以后的数据
+    result = builder.analyze_multiple_stocks(
+        max_stocks=None,  # 处理所有有效股票
+        start_date="2017-01-01",
+        sampling_interval=10  # 每10天采样一次，进一步减少数据量
+    )
     
     if result is not None:
         print(f"\n✓ 等量K线构建成功!")

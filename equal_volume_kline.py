@@ -511,11 +511,11 @@ def main():
         
         # 清理重复文件
         builder.clean_duplicate_files()
-        
+    
         # 合并现有文件
         result = builder.merge_existing_features()
-        
-        if result is not None:
+    
+    if result is not None:
             print(f"\n✓ 特征文件合并成功!")
             return result
         else:
@@ -536,11 +536,11 @@ def main():
             print(f"✓ 6大基本特征已提取: OHLC + VWAP + Amount")
             print(f"✓ 数据量已优化，训练速度将显著提升")
             print(f"✓ 结果已保存为CSV文件")
-            
-            return result
-        else:
+        
+        return result
+    else:
             print("\n✗ 分析失败，请检查数据")
-            return None
+        return None
 
 if __name__ == "__main__":
     result = main() 

@@ -3,21 +3,21 @@
         {
             "model_id": 1,
             "seed": 42,
-            "best_ic": 0.8352259398102415,
+            "best_ic": 0.898736276796886,
             "config": {
                 "model_params": {
                     "input_dim": 6,
-                    "d_model": 128,
-                    "nhead": 8,
-                    "num_layers": 3,
-                    "dim_feedforward": 512,
+                    "d_model": 256,
+                    "nhead": 16,
+                    "num_layers": 4,
+                    "dim_feedforward": 1024,
                     "dropout": 0.1,
                     "label_horizon": 10
                 },
                 "training_params": {
-                    "learning_rate": 0.0002,
+                    "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
-                    "batch_size": 512,
+                    "batch_size": 2048,
                     "num_epochs": 50
                 }
             }
@@ -25,21 +25,21 @@
         {
             "model_id": 2,
             "seed": 142,
-            "best_ic": 0.7900914487667221,
+            "best_ic": 0.9041140271084649,
             "config": {
                 "model_params": {
                     "input_dim": 6,
-                    "d_model": 128,
-                    "nhead": 8,
-                    "num_layers": 3,
-                    "dim_feedforward": 512,
+                    "d_model": 256,
+                    "nhead": 16,
+                    "num_layers": 4,
+                    "dim_feedforward": 1024,
                     "dropout": 0.1,
                     "label_horizon": 10
                 },
                 "training_params": {
-                    "learning_rate": 0.0002,
+                    "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
-                    "batch_size": 512,
+                    "batch_size": 2048,
                     "num_epochs": 50
                 }
             }
@@ -47,21 +47,21 @@
         {
             "model_id": 3,
             "seed": 242,
-            "best_ic": 0.8149876164106453,
+            "best_ic": 0.8951576203107834,
             "config": {
                 "model_params": {
                     "input_dim": 6,
-                    "d_model": 128,
-                    "nhead": 8,
-                    "num_layers": 3,
-                    "dim_feedforward": 512,
+                    "d_model": 256,
+                    "nhead": 16,
+                    "num_layers": 4,
+                    "dim_feedforward": 1024,
                     "dropout": 0.1,
                     "label_horizon": 10
                 },
                 "training_params": {
-                    "learning_rate": 0.0002,
+                    "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
-                    "batch_size": 512,
+                    "batch_size": 2048,
                     "num_epochs": 50
                 }
             }
@@ -74,5 +74,5 @@
         142,
         242
     ],
-    "training_date": "2025-07-03T16:50:20.363133"
+    "training_date": "2025-07-07T16:45:40.152629"
 }

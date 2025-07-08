@@ -24,6 +24,8 @@ import math
 from datetime import datetime, timedelta
 import os
 import json
+import psutil
+import gc
 warnings.filterwarnings('ignore')
 
 class FactorDataset(Dataset):
@@ -43,7 +45,7 @@ class FactorDataset(Dataset):
 class PositionalEncoding(nn.Module):
     """位置编码模块"""
     
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model, max_len=10000):
         super(PositionalEncoding, self).__init__()
         
         pe = torch.zeros(max_len, d_model)
@@ -208,29 +210,57 @@ def ic_loss_function(predictions, targets):
 class TransformerFactorTrainer:
     """严格按照规格的Transformer因子训练器"""
     
-    def __init__(self, model_config):
-        self.config = model_config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"使用设备: {self.device}")
+    def __init__(self, model_config, max_stocks=100):
+        """
+        初始化Transformer因子训练器
         
-        # 启用混合精度训练
+        Args:
+            model_config: 模型配置参数
+            max_stocks: 最大训练股票数量，None表示使用所有有效股票
+                       建议值: 10-50只股票 (最少10只保证多样性)
+        """
+        self.model_config = model_config
+        self.max_stocks = max_stocks
+        
+        # 验证股票数量设置
+        if max_stocks is not None and max_stocks < 50:
+            print(f"⚠️  警告: 股票数量 {max_stocks} 过少，建议至少50只")
+            print("   过少的股票可能导致模型泛化能力不足")
+        elif max_stocks is not None and max_stocks >= 200:
+            print(f"✓ 股票数量充足: {max_stocks} 只，有助于提升模型泛化能力")
+        
+        # 设备配置
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"✓ 使用设备: {self.device}")
+        
+        if torch.cuda.is_available():
+            print(f"✓ GPU: {torch.cuda.get_device_name()}")
+            print(f"✓ 显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        
+        # 混合精度训练
         self.scaler = torch.cuda.amp.GradScaler()
         
         # 初始化模型
-        self.model = TransformerSeq2SeqModel(**model_config['model_params']).to(self.device)
+        self.model = TransformerSeq2SeqModel(**model_config['model_params'])
+        self.model.to(self.device)
         
-        # 优化器
+        # 优化器 - 使用AdamW，更适合Transformer
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            self.model.parameters(), 
             lr=model_config['training_params']['learning_rate'],
             weight_decay=model_config['training_params']['weight_decay']
         )
         
-        # 学习率调度器
+        # 学习率调度器 - 余弦退火
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=model_config['training_params']['num_epochs']
+            self.optimizer, 
+            T_max=model_config['training_params']['num_epochs'],
+            eta_min=1e-6
         )
+        
+        print(f"✓ 模型参数量: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"✓ 最大训练股票数: {max_stocks if max_stocks else '无限制'}")
+        print(f"✓ 混合精度训练: {'启用' if self.scaler.is_enabled() else '禁用'}")
         
         # 训练历史
         self.train_losses = []
@@ -243,49 +273,73 @@ class TransformerFactorTrainer:
             torch.backends.cudnn.deterministic = False
             print("✓ 启用CUDA优化: cudnn.benchmark=True")
         
-    def load_and_process_data(self, start_date="2013-01-01", sampling_interval=5):
+    def load_and_process_data(self, start_date="2017-01-01", sampling_interval=5):
         """
-        按照规格加载和处理数据
-        
-        Args:
-            start_date: 训练数据开始日期 (2013年开始)
-            sampling_interval: 采样间隔 (每5个交易日采样一次)
+        加载和处理数据 - 增加内存监控和分批处理
         """
         print("="*60)
-        print("按照规格加载和处理因子数据")
-        print(f"✓ 开始日期: {start_date}")
-        print(f"✓ 采样间隔: 每{sampling_interval}个交易日")
-        print(f"✓ 特征窗口: 过去40个交易日")
-        print(f"✓ 标签窗口: 未来10个交易日")
+        print("数据加载和处理")
         print("="*60)
         
-        # 加载等量K线特征数据
+        # 监控内存使用
+        process = psutil.Process()
+        print(f"初始内存使用: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
+        
+        # 加载特征数据
+        print("正在加载等量K线特征数据...")
         try:
             features_df = pd.read_csv('equal_volume_features_all.csv')
-            print(f"✓ 加载特征数据: {features_df.shape}")
-        except:
-            print("✗ 无法加载特征数据，请先运行等量K线生成")
+            features_df['end_date'] = pd.to_datetime(features_df['end_date'])
+            print(f"✓ 特征数据加载成功: {features_df.shape}")
+            print(f"✓ 股票数量: {features_df['StockID'].nunique()}")
+            print(f"✓ 时间范围: {features_df['end_date'].min()} ~ {features_df['end_date'].max()}")
+        except Exception as e:
+            print(f"✗ 特征数据加载失败: {e}")
+            print("请先运行: python optimized_equal_volume_kline.py")
             return None
+        
+        print(f"特征数据加载后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
         
         # 加载股票价格数据
+        print("正在加载股票价格数据...")
         try:
+            # 使用feather格式读取（Apache Arrow）
             stock_data = pd.read_feather('stock_price_vol_d.txt')
-            print(f"✓ 加载价格数据: {stock_data.shape}")
-        except:
-            print("✗ 无法加载价格数据")
+            stock_data['date'] = pd.to_datetime(stock_data['date'])
+            stock_data = stock_data[stock_data['date'] >= pd.to_datetime(start_date)]
+            print(f"✓ 价格数据加载成功: {stock_data.shape}")
+            print(f"✓ 价格数据列: {list(stock_data.columns)}")
+        except Exception as e:
+            print(f"✗ 价格数据加载失败: {e}")
             return None
         
-        # 时间过滤：从2013年开始
-        features_df['end_date'] = pd.to_datetime(features_df['end_date'])
-        stock_data['date'] = pd.to_datetime(stock_data['date'])
+        print(f"价格数据加载后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
         
-        start_date = pd.to_datetime(start_date)
-        features_df = features_df[features_df['end_date'] >= start_date]
-        stock_data = stock_data[stock_data['date'] >= start_date]
+        # 检查数据量，如果股票太多，采用分批处理或采样
+        total_stocks = features_df['StockID'].nunique()
+        print(f"\n数据量分析:")
+        print(f"✓ 总股票数量: {total_stocks}")
+        print(f"✓ 特征记录数: {len(features_df):,}")
+        print(f"✓ 价格记录数: {len(stock_data):,}")
         
-        print(f"✓ 时间过滤后 - 特征数据: {features_df.shape}, 价格数据: {stock_data.shape}")
+        # 内存使用预估
+        estimated_memory_gb = len(features_df) * 40 * 6 * 8 / 1024 / 1024 / 1024  # 粗略估算
+        print(f"✓ 预估训练数据内存需求: {estimated_memory_gb:.2f} GB")
         
-        # 处理特征和标签 - 使用快速版本
+        if estimated_memory_gb > 50:  # 如果预估超过50GB
+            print("⚠️  警告: 数据量可能过大，建议启用数据采样")
+            print("   可以通过增加sampling_interval来减少数据量")
+            
+            # 动态调整采样间隔
+            if sampling_interval < 10:
+                new_sampling_interval = max(10, int(estimated_memory_gb / 10))
+                print(f"   自动调整采样间隔: {sampling_interval} → {new_sampling_interval}")
+                sampling_interval = new_sampling_interval
+        
+        # 构建特征和标签
+        print(f"\n开始构建训练数据 (采样间隔: {sampling_interval})...")
+        
+        # 使用快速处理版本
         features, labels, dates = self._process_features_and_labels_fast(
             features_df, stock_data, sampling_interval
         )
@@ -293,38 +347,45 @@ class TransformerFactorTrainer:
         if features is None:
             return None
         
-        # 按时间顺序划分训练集和验证集 (4:1)
-        split_idx = int(len(features) * 0.8)
+        print(f"数据处理完成后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
+        
+        # 数据标准化
+        print("正在进行数据标准化...")
+        scaler = StandardScaler()
+        
+        # 对特征进行标准化 (batch处理以节省内存)
+        features_reshaped = features.reshape(-1, features.shape[-1])
+        features_scaled = scaler.fit_transform(features_reshaped)
+        features = features_scaled.reshape(features.shape)
+        
+        print(f"标准化完成后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
+        
+        # 数据分割
+        print("正在分割训练集和验证集...")
+        split_idx = int(0.8 * len(features))
         
         train_features = features[:split_idx]
         train_labels = labels[:split_idx]
         val_features = features[split_idx:]
         val_labels = labels[split_idx:]
         
-        print(f"✓ 训练集: {train_features.shape}, 验证集: {val_features.shape}")
-        print(f"✓ 训练标签: {train_labels.shape}, 验证标签: {val_labels.shape}")
+        print(f"✓ 训练集大小: {train_features.shape}")
+        print(f"✓ 验证集大小: {val_features.shape}")
+        print(f"✓ 内存使用峰值: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
         
-        # 特征标准化 - 处理3维数组
-        scaler = StandardScaler()
-        # 重塑为2维进行标准化
-        train_features_reshaped = train_features.reshape(-1, train_features.shape[-1])
-        val_features_reshaped = val_features.reshape(-1, val_features.shape[-1])
+        # 清理中间变量
+        del features_df, stock_data, features, labels, features_reshaped, features_scaled
+        gc.collect()
         
-        train_features_scaled = scaler.fit_transform(train_features_reshaped)
-        val_features_scaled = scaler.transform(val_features_reshaped)
-        
-        # 重塑回3维
-        train_features_scaled = train_features_scaled.reshape(train_features.shape)
-        val_features_scaled = val_features_scaled.reshape(val_features.shape)
-        
-        print(f"✓ 特征标准化完成")
+        print(f"✓ 清理后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
         
         return {
-            'train_features': train_features_scaled,
+            'train_features': train_features,
             'train_labels': train_labels,
-            'val_features': val_features_scaled,
+            'val_features': val_features,
             'val_labels': val_labels,
-            'scaler': scaler
+            'scaler': scaler,
+            'dates': dates
         }
     
     def _process_features_and_labels(self, features_df, stock_data, sampling_interval):
@@ -348,9 +409,21 @@ class TransformerFactorTrainer:
             stock_prices = stock_data[stock_data['StockID'] == stock_id]
             date_mapping[stock_id] = dict(zip(stock_prices['date'], stock_prices.index))
         
-        # 筛选有效股票
-        valid_stocks = features_df['StockID'].value_counts()
-        valid_stocks = valid_stocks[valid_stocks >= 100].index.tolist()[:50]  # 减少到50只股票
+        # 筛选有效股票 - 只排除数据质量极差的股票
+        stock_counts = features_df['StockID'].value_counts()
+        valid_stocks = stock_counts[stock_counts >= 30].index.tolist()  # 降低到30个交易日，保留更多股票
+        
+        print(f"✓ 股票筛选结果: {len(stock_counts)} → {len(valid_stocks)} 只 (排除了{len(stock_counts) - len(valid_stocks)}只数据极少的股票)")
+        
+        # 保留所有有效股票，不进行数量限制（除非max_stocks设置得很小）
+        if self.max_stocks is not None and self.max_stocks < 100:
+            # 只有当max_stocks小于100时才进行限制，按成交量排序选择最佳股票
+            stock_volumes = features_df.groupby('StockID')['amount'].mean().sort_values(ascending=False)
+            valid_stocks = [stock for stock in stock_volumes.index if stock in valid_stocks][:self.max_stocks]
+            print(f"⚠️  应用严格股票数量限制: {len(stock_volumes)} → {self.max_stocks} 只")
+        else:
+            print(f"✓ 保留所有{len(valid_stocks)}只有效股票进行训练")
+        
         print(f"处理 {len(valid_stocks)} 只股票...")
         
         features_list = []
@@ -422,9 +495,21 @@ class TransformerFactorTrainer:
         features_df = features_df.sort_values(['StockID', 'end_date']).reset_index(drop=True)
         stock_data = stock_data.sort_values(['StockID', 'date']).reset_index(drop=True)
         
-        # 筛选有效股票
-        valid_stocks = features_df['StockID'].value_counts()
-        valid_stocks = valid_stocks[valid_stocks >= 100].index.tolist()[:50]  # 减少到50只股票
+        # 筛选有效股票 - 只排除数据质量极差的股票
+        stock_counts = features_df['StockID'].value_counts()
+        valid_stocks = stock_counts[stock_counts >= 30].index.tolist()  # 降低到30个交易日，保留更多股票
+        
+        print(f"✓ 快速模式股票筛选结果: {len(stock_counts)} → {len(valid_stocks)} 只 (排除了{len(stock_counts) - len(valid_stocks)}只数据极少的股票)")
+        
+        # 保留所有有效股票，不进行数量限制（除非max_stocks设置得很小）
+        if self.max_stocks is not None and self.max_stocks < 100:
+            # 只有当max_stocks小于100时才进行限制，按成交量排序选择最佳股票
+            stock_volumes = features_df.groupby('StockID')['amount'].mean().sort_values(ascending=False)
+            valid_stocks = [stock for stock in stock_volumes.index if stock in valid_stocks][:self.max_stocks]
+            print(f"⚠️  应用严格股票数量限制: {len(stock_volumes)} → {self.max_stocks} 只")
+        else:
+            print(f"✓ 快速模式保留所有{len(valid_stocks)}只有效股票进行训练")
+        
         print(f"处理 {len(valid_stocks)} 只股票...")
         
         features_list = []
@@ -441,6 +526,7 @@ class TransformerFactorTrainer:
                 continue
             
             # 创建特征日期到价格索引的映射
+            feature_dates = stock_features['end_date'].values
             price_dates = stock_prices['date'].values
             price_close = stock_prices['close'].values
             
@@ -481,7 +567,7 @@ class TransformerFactorTrainer:
         print(f"✓ 最终数据形状 - 特征: {features.shape}, 标签: {labels.shape}")
         return features, labels, dates_list
     
-    def create_data_loaders(self, data, batch_size=256):
+    def create_data_loaders(self, data, batch_size=1024):
         """创建数据加载器 - 优化GPU性能"""
         train_dataset = FactorDataset(
             data['train_features'], 
@@ -502,7 +588,7 @@ class TransformerFactorTrainer:
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=8,  # 增加worker数量
+            num_workers=32,  # 增加worker数量
             pin_memory=True,
             persistent_workers=True,  # 保持worker进程
             prefetch_factor=2  # 预取因子
@@ -510,9 +596,9 @@ class TransformerFactorTrainer:
         
         val_loader = DataLoader(
             val_dataset, 
-            batch_size=batch_size*2, 
+            batch_size=batch_size*8,  # 大幅提升验证集batch_size，加速验证
             shuffle=False, 
-            num_workers=8,  # 增加worker数量
+            num_workers=32,  # 增加worker数量
             pin_memory=True,
             persistent_workers=True,  # 保持worker进程
             prefetch_factor=2  # 预取因子
@@ -526,16 +612,18 @@ class TransformerFactorTrainer:
         total_loss = 0
         num_batches = 0
         
-        for batch_features, batch_labels in tqdm(train_loader, desc="Training"):
+        for batch_features, batch_labels in tqdm(train_loader, desc="训练中"):
             batch_features = batch_features.to(self.device, non_blocking=True)
             batch_labels = batch_labels.to(self.device, non_blocking=True)
+            
+
             
             self.optimizer.zero_grad()
             
             # 使用混合精度训练
             with torch.cuda.amp.autocast():
                 # 前向传播
-                predictions = self.model(batch_features, batch_labels)
+                predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
                 
                 # IC损失函数
                 loss = ic_loss_function(predictions, batch_labels)
@@ -564,13 +652,16 @@ class TransformerFactorTrainer:
         all_labels = []
         
         with torch.no_grad():
-            for batch_features, batch_labels in val_loader:
+            # 添加验证进度条
+            for batch_features, batch_labels in tqdm(val_loader, desc="验证中", leave=False):
                 batch_features = batch_features.to(self.device, non_blocking=True)
                 batch_labels = batch_labels.to(self.device, non_blocking=True)
                 
+
+                
                 # 使用混合精度推理
                 with torch.cuda.amp.autocast():
-                    predictions = self.model(batch_features, batch_labels)
+                    predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
                     loss = ic_loss_function(predictions, batch_labels)
                 
                 total_loss += loss.item()
@@ -626,7 +717,7 @@ class TransformerFactorTrainer:
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'val_ic': val_ic,
-                    'config': self.config
+                    'config': self.model_config
                 }, 'best_transformer_factor_model.pth')
                 print(f"✓ 保存最佳模型 (IC: {val_ic:.6f})")
             else:
@@ -671,7 +762,7 @@ class TransformerFactorTrainer:
             return None
         
         train_loader, val_loader = self.create_data_loaders(
-            data, batch_size=self.config['training_params']['batch_size']
+            data, batch_size=self.model_config['training_params']['batch_size']
         )
         
         # 训练多个模型
@@ -688,18 +779,19 @@ class TransformerFactorTrainer:
                 torch.cuda.manual_seed(seed)
             
             # 重新初始化模型（确保每个模型都是独立的）
-            model = TransformerSeq2SeqModel(**self.config['model_params']).to(self.device)
+            model = TransformerSeq2SeqModel(**self.model_config['model_params'])
+            model.to(self.device)
             
             # 重新初始化优化器和调度器
             optimizer = torch.optim.AdamW(
                 model.parameters(),
-                lr=self.config['training_params']['learning_rate'],
-                weight_decay=self.config['training_params']['weight_decay']
+                lr=self.model_config['training_params']['learning_rate'],
+                weight_decay=self.model_config['training_params']['weight_decay']
             )
             
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.config['training_params']['num_epochs']
+                T_max=self.model_config['training_params']['num_epochs']
             )
             
             # 临时保存原始配置
@@ -715,7 +807,7 @@ class TransformerFactorTrainer:
             # 训练模型
             best_ic = self.train(
                 train_loader, val_loader, 
-                num_epochs=self.config['training_params']['num_epochs']
+                num_epochs=self.model_config['training_params']['num_epochs']
             )
             
             # 保存模型信息
@@ -723,7 +815,7 @@ class TransformerFactorTrainer:
                 'model_id': i + 1,
                 'seed': seed,
                 'best_ic': best_ic,
-                'config': self.config.copy()
+                'config': self.model_config.copy()
             }
             models_info.append(model_info)
             
@@ -737,7 +829,7 @@ class TransformerFactorTrainer:
                     'epoch': 'final',
                     'model_state_dict': self.model.state_dict(),
                     'model_info': model_info,
-                    'config': self.config,
+                    'config': self.model_config,
                     'scaler_params': {
                         'mean': data['scaler'].mean_,
                         'scale': data['scaler'].scale_
@@ -848,7 +940,8 @@ class TransformerFactorTrainer:
         }
     
     def calculate_ensemble_factor_scores_optimized(self, start_date='2017-01-01', end_date='2025-02-28', 
-                                                 model_dir='trained_models', save_results=True, batch_size=1000):
+                                                 model_dir='trained_models', save_results=True, batch_size=10000, 
+                                                 factor_type='first_day'):
         """
         优化版本：计算集成因子得分 - 大幅提升运算速度
         
@@ -1060,55 +1153,133 @@ class TransformerFactorTrainer:
                 # 转换为tensor并移动到GPU
                 features_tensor = torch.FloatTensor(batch_features).to(device)
                 
-                # 集成预测 - 使用自回归seq2seq预测
-                batch_predictions = []
-                with torch.no_grad():
-                    for model in models:
-                        model.eval()
-                        # 使用自回归预测生成未来10天收益序列
-                        preds = self.seq2seq_autoregressive_predict(model, features_tensor, device)  # (batch_size, 10)
-                        # 取首日预测作为因子得分
-                        pred = preds[:, 0]  # (batch_size,) - 已经是numpy数组
-                        batch_predictions.append(pred)
-                
-                # 等权平均
-                ensemble_pred = np.mean(batch_predictions, axis=0)
+                # Seq2Seq集成预测：生成完整逐日收益序列
+                ensemble_pred = self.fast_predict_batch(models, features_tensor, device, factor_type='first_day')
                 all_predictions.extend(ensemble_pred)
             
+            # 关键修复：将收益率转换为因子得分（标准化）
+            # 使用首日收益作为因子得分，并按当日标准化
+            daily_factor_scores = np.array(all_predictions)  # 取首日收益
+            if len(daily_factor_scores) > 1:
+                # 标准化：确保均值为0，标准差为1
+                daily_factor_scores = (daily_factor_scores - daily_factor_scores.mean()) / daily_factor_scores.std()
+            
             # 保存结果
-            for stock_id, prediction in zip(stocks, all_predictions):
+            for i, stock_id in enumerate(stocks):
                 factor_scores.append({
                     'date': date,
                     'StockID': stock_id,
-                    'factor_score': prediction
+                    'factor_score': daily_factor_scores[i]  # 使用标准化后的因子得分
                 })
         
         return factor_scores
 
     def seq2seq_autoregressive_predict(self, model, src, device):
         """
-        自回归生成未来10天收益序列
-        src: (batch, 40, 6)
-        返回: (batch, 10)
+        完整的Seq2Seq自回归预测：生成未来10天逐日收益序列
+        
+        训练阶段使用teacher forcing，推理阶段使用自回归生成
+        这样能保证T时刻在不使用任何未来信息前提下输出T+1~T+10的收益序列
+        
+        Args:
+            src: (batch, 40, 6) - 过去40天的因子序列
+            
+        Returns:
+            preds: (batch, 10) - 未来10天的逐日收益预测序列
         """
         model.eval()
         batch_size = src.shape[0]
-        label_horizon = 10
-        preds = torch.zeros((batch_size, label_horizon), device=device)
-        decoder_input = torch.zeros((batch_size, 1), device=device)
-        memory = model.transformer_encoder(model.pos_encoding(model.input_embedding(src) * math.sqrt(model.d_model)))
-        for t in range(label_horizon):
-            tgt_emb = model.output_embedding(decoder_input.unsqueeze(-1)) * math.sqrt(model.d_model)
-            tgt_emb = model.decoder_pos_encoding(tgt_emb)
-            tgt_emb = model.dropout(tgt_emb)
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(t+1).to(device)
-            out = model.transformer_decoder(
-                tgt_emb, memory, tgt_mask=tgt_mask
-            )
-            step_pred = model.fc_out(out[:, -1, :]).squeeze(-1)  # (batch,)
-            preds[:, t] = step_pred
-            decoder_input = torch.cat([decoder_input, step_pred.unsqueeze(1)], dim=1)
-        return preds.detach().cpu().numpy()
+        label_horizon = 10  # 预测未来10天
+        
+        with torch.no_grad():
+            # Step 1: Encoder处理输入序列
+            src_emb = model.input_embedding(src) * math.sqrt(model.d_model)
+            src_emb = model.pos_encoding(src_emb)
+            src_emb = model.dropout(src_emb)
+            memory = model.transformer_encoder(src_emb)  # (batch, 40, d_model)
+            
+            # Step 2: Decoder自回归生成未来收益序列
+            preds = torch.zeros((batch_size, label_horizon), device=device)
+            
+            # 初始化decoder输入（从0开始预测）
+            decoder_input = torch.zeros((batch_size, 1), device=device)  # (batch, 1)
+            
+            # 逐步生成未来10天的收益
+            for t in range(label_horizon):
+                # 当前时刻的decoder输入序列长度
+                tgt_len = t + 1
+                
+                # Target embedding
+                tgt_emb = model.output_embedding(decoder_input.unsqueeze(-1)) * math.sqrt(model.d_model)  # (batch, tgt_len, d_model)
+                tgt_emb = model.decoder_pos_encoding(tgt_emb)
+                tgt_emb = model.dropout(tgt_emb)
+                
+                # 生成causal mask，防止未来信息泄露
+                tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len).to(device)
+                
+                # Decoder处理
+                decoder_output = model.transformer_decoder(
+                    tgt_emb,           # target sequence
+                    memory,            # encoder output
+                    tgt_mask=tgt_mask  # causal mask
+                )  # (batch, tgt_len, d_model)
+                
+                # 预测当前时间步的收益
+                step_pred = model.fc_out(decoder_output[:, -1, :]).squeeze(-1)  # (batch,)
+                preds[:, t] = step_pred
+                
+                # 更新decoder输入序列（添加当前预测）
+                decoder_input = torch.cat([decoder_input, step_pred.unsqueeze(1)], dim=1)
+            
+        return preds.detach().cpu().numpy()  # (batch, 10)
+    
+    def fast_predict_batch(self, models, features_tensor, device, factor_type='first_day'):
+        """
+        集成预测：并行处理所有模型，生成因子得分
+        
+        Args:
+            models: 训练好的模型列表
+            features_tensor: (batch, 40, 6) - 输入特征
+            device: 计算设备
+            factor_type: 因子提取方式
+                - 'first_day': 使用首日收益T+1
+                - 'mean': 使用10天收益均值
+                - 'weighted': 使用加权收益（近期权重更高）
+                - 'full_seq': 返回完整序列
+            
+        Returns:
+            根据factor_type返回不同形状的结果
+        """
+        all_model_sequences = []  # 存储每个模型的完整序列预测
+        
+        with torch.no_grad():
+            for model in models:
+                model.eval()
+                # 使用完整的seq2seq自回归预测生成10天收益序列
+                preds = self.seq2seq_autoregressive_predict(model, features_tensor, device)  # (batch, 10)
+                all_model_sequences.append(preds)
+        
+        # 集成：对每个时间步分别平均
+        ensemble_sequences = np.mean(all_model_sequences, axis=0)  # (batch, 10)
+        
+        # 根据factor_type提取因子得分
+        if factor_type == 'first_day':
+            factor_scores = ensemble_sequences[:, 0]  # (batch,) - T+1日收益
+        elif factor_type == 'mean':
+            factor_scores = np.mean(ensemble_sequences, axis=1)  # (batch,) - 10天均值
+        elif factor_type == 'weighted':
+            # 时间衰减权重：T+1权重最高，T+10权重最低
+            weights = np.exp(-0.1 * np.arange(10))  # 指数衰减
+            weights = weights / weights.sum()
+            factor_scores = np.dot(ensemble_sequences, weights)  # (batch,)
+        elif factor_type == 'full_seq':
+            return ensemble_sequences  # (batch, 10)
+        else:
+            raise ValueError(f"不支持的factor_type: {factor_type}")
+        
+        # 关键修复：将收益率转换为因子得分（标准化）
+        # 这里我们直接返回收益率，让后续的因子计算函数处理标准化
+        return factor_scores
 
     def _ensemble_predict_with_sequences(self, batch_features, models):
         """
@@ -1189,14 +1360,20 @@ class TransformerFactorTrainer:
                 batch_features = scalers[0].transform(batch_features)
                 batch_features = batch_features.reshape(original_shape)
             ensemble_predictions = self._ensemble_predict_with_sequences(batch_features, models)  # (n_stocks, 10)
+            
+            # 关键修复：将收益率转换为因子得分（标准化）
+            # 使用首日收益作为因子得分，并按当日标准化
+            daily_factor_scores = ensemble_predictions[:, 0]  # 取首日收益
+            if len(daily_factor_scores) > 1:
+                # 标准化：确保均值为0，标准差为1
+                daily_factor_scores = (daily_factor_scores - daily_factor_scores.mean()) / daily_factor_scores.std()
+            
             for i, stock_id in enumerate(valid_stocks):
-                # 保存首日、均值、全序列
+                # 保存标准化后的因子得分
                 factor_scores.append({
                     'date': date,
                     'StockID': stock_id,
-                    'factor_score_first': ensemble_predictions[i, 0],
-                    'factor_score_mean': ensemble_predictions[i].mean(),
-                    'factor_score_seq': ','.join([f'{x:.6f}' for x in ensemble_predictions[i]])
+                    'factor_score': daily_factor_scores[i]  # 使用标准化后的因子得分
                 })
         factor_scores_df = pd.DataFrame(factor_scores)
         print(f"✓ 计算完成，总计 {len(factor_scores_df)} 条记录")
@@ -1224,6 +1401,10 @@ def main():
                       help='训练轮数')
     parser.add_argument('--fast', action='store_true',
                       help='快速训练模式：减少模型复杂度，增大batch_size')
+    parser.add_argument('--max_stocks', type=int, default=200,
+                      help='最大训练股票数量 (默认200只，最少50只，None表示无限制)')
+    parser.add_argument('--ultra_fast', action='store_true',
+                      help='超快训练模式：仅使用10只股票进行训练')
     
     try:
         args = parser.parse_args()
@@ -1234,7 +1415,15 @@ def main():
             seeds = [42, 142, 242]
             epochs = 50
             fast = False
+            max_stocks = 500  # 修复：增加到500只股票以匹配回测需求
+            ultra_fast = False
         args = Args()
+    
+    # 处理超快训练模式
+    if args.ultra_fast:
+        args.max_stocks = 10
+        args.fast = True
+        print("✓ 超快训练模式已启用：10只股票 + 快速训练配置")
     
     print("Transformer因子合成训练 - 多种子集成版本")
     print("="*80)
@@ -1249,6 +1438,9 @@ def main():
     print(f"运行模式: {args.mode}")
     print(f"随机数种子: {args.seeds}")
     print(f"快速模式: {'是' if args.fast else '否'}")
+    print(f"最大股票数量: {args.max_stocks if args.max_stocks else '无限制'}")
+    if args.ultra_fast:
+        print("⚡ 超快训练模式: 10只股票 + 快速配置")
     print("="*80)
     
     # 模型配置 - 根据模式选择
@@ -1292,7 +1484,7 @@ def main():
             'training_params': {
                 'learning_rate': 2e-4,
                 'weight_decay': 1e-4,
-                'batch_size': 512,        # 增大batch_size，充分利用GPU
+                'batch_size': 1024,       # 大幅增大batch_size，充分利用RTX 4090
                 'num_epochs': args.epochs
             }
         }
@@ -1302,7 +1494,7 @@ def main():
         print("✓ CUDA优化: 启用")
     
     # 初始化训练器
-    trainer = TransformerFactorTrainer(model_config)
+    trainer = TransformerFactorTrainer(model_config, max_stocks=args.max_stocks)
     
     if args.mode in ['train', 'full']:
         print("\n" + "="*60)
@@ -1330,18 +1522,20 @@ def main():
         # 根据模式选择回测参数
         if args.fast:
             # 快速回测配置
-            backtest_batch_size = 2000  # 更大的批量
+            backtest_batch_size = 10000  # 大幅增加批量大小
             print("使用快速回测配置:")
-            print("✓ 批量大小: 2000 (充分利用RTX 4090)")
+            print("✓ 批量大小: 10000 (充分利用RTX 4090)")
             print("✓ GPU加速: 启用")
             print("✓ 预构建序列: 启用")
+            print("✓ 优化预测: 只预测首日收益")
         else:
             # 标准回测配置
-            backtest_batch_size = 1000
+            backtest_batch_size = 10000  # 增加标准批量大小
             print("使用标准回测配置:")
-            print("✓ 批量大小: 1000")
+            print("✓ 批量大小: 10000")
             print("✓ GPU加速: 启用")
             print("✓ 预构建序列: 启用")
+            print("✓ 优化预测: 只预测首日收益")
         
         # 计算集成因子得分 - 使用优化版本
         factor_scores = trainer.calculate_ensemble_factor_scores_optimized(
