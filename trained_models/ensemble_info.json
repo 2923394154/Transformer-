@@ -2,8 +2,8 @@
     "models": [
         {
             "model_id": 1,
-            "seed": 42,
-            "best_ic": 0.898736276796886,
+            "seed": 123,
+            "best_ic": 0.15720419077860198,
             "config": {
                 "model_params": {
                     "input_dim": 6,
@@ -18,14 +18,14 @@
                     "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
                     "batch_size": 2048,
-                    "num_epochs": 50
+                    "num_epochs": 200
                 }
             }
         },
         {
             "model_id": 2,
-            "seed": 142,
-            "best_ic": 0.9041140271084649,
+            "seed": 456,
+            "best_ic": 0.14230883429490176,
             "config": {
                 "model_params": {
                     "input_dim": 6,
@@ -40,14 +40,14 @@
                     "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
                     "batch_size": 2048,
-                    "num_epochs": 50
+                    "num_epochs": 200
                 }
             }
         },
         {
             "model_id": 3,
-            "seed": 242,
-            "best_ic": 0.8951576203107834,
+            "seed": 789,
+            "best_ic": 0.14931160583281478,
             "config": {
                 "model_params": {
                     "input_dim": 6,
@@ -62,7 +62,7 @@
                     "learning_rate": 0.0003,
                     "weight_decay": 0.0001,
                     "batch_size": 2048,
-                    "num_epochs": 50
+                    "num_epochs": 200
                 }
             }
         }
@@ -70,9 +70,9 @@
     "ensemble_type": "equal_weight",
     "num_models": 3,
     "seeds": [
-        42,
-        142,
-        242
+        123,
+        456,
+        789
     ],
-    "training_date": "2025-07-07T16:45:40.152629"
+    "training_date": "2025-07-08T13:12:22.407615"
 }

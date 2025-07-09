@@ -615,7 +615,7 @@ class FactorTrainer:
             # 使用混合精度训练
             if self.use_amp:
                 with autocast():
-            predictions = self.model(batch_features)
+                    predictions = self.model(batch_features)
                     loss = self.loss_functions[self.loss_type](predictions, batch_labels)
                 
                 # 缩放损失并反向传播
@@ -666,7 +666,7 @@ class FactorTrainer:
                         predictions = self.model(batch_features)
                         loss = self.loss_functions[self.loss_type](predictions, batch_labels)
                 else:
-                predictions = self.model(batch_features)
+                    predictions = self.model(batch_features)
                     loss = self.loss_functions[self.loss_type](predictions, batch_labels)
                 
                 total_loss += loss.item()
@@ -706,8 +706,8 @@ class FactorTrainer:
             should_validate = epoch < 20 or epoch % 2 == 0
             
             if should_validate:
-            # 验证
-            val_loss, val_ic = self.validate(val_loader)
+                # 验证
+                val_loss, val_ic = self.validate(val_loader)
             else:
                 # 跳过验证，使用上一次的值
                 val_loss, val_ic = self.val_losses[-1] if self.val_losses else 0.0, self.val_ics[-1] if self.val_ics else 0.0

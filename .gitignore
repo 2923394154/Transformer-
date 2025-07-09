@@ -9,6 +9,7 @@ barra_Exposure(2).
 *.hdf5
 *.pkl
 *.pickle
+*.png
 
 # 模型文件
 *.pt

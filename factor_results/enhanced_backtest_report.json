@@ -1,0 +1,17 @@
+{
+    "ic_6d_mean": 0.025812825052934134,
+    "ic_6d_std": 0.061037686247899126,
+    "ic_6d_ir": 0.422899795842484,
+    "ic_6d_positive_ratio": 0.6560975609756098,
+    "rank_ic_6d_mean": 0.03154898033422423,
+    "rank_ic_6d_std": 0.07642002378914568,
+    "rank_ic_6d_ir": 0.41283656782511086,
+    "rank_ic_6d_positive_ratio": 0.6560975609756098,
+    "top_6d_annual_return": 0.5622658023257326,
+    "top_6d_sharpe_ratio": 0.7720420346112625,
+    "top_6d_win_rate": 0.4951219512195122,
+    "avg_buy_turnover": 0.2556152829084715,
+    "avg_sell_turnover": 0.2545063546060087,
+    "avg_total_turnover": 0.5101216375144803,
+    "turnover_std": 0.6075368535381296
+}

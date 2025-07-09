@@ -89,8 +89,8 @@ def process_stock_data():
     stock_data = stock_data.dropna(subset=numeric_columns)
     stock_data = stock_data.sort_values(['StockID', 'date'])
     
-    # 筛选时间范围：2017年至今
-    start_date = pd.to_datetime('2017-01-01')
+    # 筛选时间范围：2013年至今
+    start_date = pd.to_datetime('2013-01-01')
     stock_data = stock_data[stock_data['date'] >= start_date]
     
     print(f"✓ 预处理完成: {stock_data.shape}")

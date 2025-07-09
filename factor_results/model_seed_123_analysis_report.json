@@ -1,0 +1,19 @@
+{
+    "rank_ic_mean": 0.028525025098714206,
+    "rank_ic_std": 0.0790565295505726,
+    "rank_ic_ir": 0.36081807866947535,
+    "rank_ic_positive_ratio": 0.6647230320699709,
+    "top_annual_return": 0.4346879783688551,
+    "bottom_annual_return": -0.2968059473644104,
+    "long_short_annual_return": 0.7314939257332655,
+    "top_sharpe_ratio": 0.6332024860316855,
+    "bottom_sharpe_ratio": -0.4694662853307112,
+    "long_short_sharpe_ratio": 2.836729324376957,
+    "top_win_rate": 0.49620991253644314,
+    "bottom_win_rate": 0.4186588921282799,
+    "long_short_win_rate": 0.6600583090379009,
+    "avg_turnover_rate": 1.0,
+    "turnover_std": 0.0,
+    "avg_sell_count": 79.41306884480747,
+    "avg_buy_count": 79.34947491248542
+}
