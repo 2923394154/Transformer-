@@ -3,6 +3,7 @@
 """
 简化直接股票数据处理脚本 - GPU加速版本
 直接处理原始K线数据，输出格式匹配现有训练脚本
+修复异常值问题，改进VWAP计算
 """
 
 import pandas as pd
@@ -20,6 +21,135 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
     print("⚠ GPU加速不可用，使用CPU处理")
+
+def preprocess_data(stock_data):
+    """数据预处理 - 添加异常值检测和清理"""
+    print("正在进行数据预处理和异常值清理...")
+    
+    # 标准化列名
+    if 'volume' in stock_data.columns:
+        stock_data = stock_data.rename(columns={'volume': 'vol'})
+    
+    # 数据类型转换
+    stock_data['date'] = pd.to_datetime(stock_data['date'])
+    numeric_columns = ['open', 'high', 'low', 'close', 'vol', 'amount']
+    
+    for col in numeric_columns:
+        if col in stock_data.columns:
+            stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce')
+    
+    # 删除缺失值
+    stock_data = stock_data.dropna(subset=numeric_columns)
+    stock_data = stock_data.sort_values(['StockID', 'date'])
+    
+    # 筛选时间范围：2013年至今
+    start_date = pd.to_datetime('2013-01-01')
+    stock_data = stock_data[stock_data['date'] >= start_date]
+    
+    print(f"✓ 基础预处理完成: {stock_data.shape}")
+    
+    # === 异常值检测和清理 ===
+    print("正在进行异常值检测和清理...")
+    
+    # 1. 价格异常值检测（价格不能为负或过大）
+    price_cols = ['open', 'high', 'low', 'close']
+    for col in price_cols:
+        if col in stock_data.columns:
+            # 价格应该在合理范围内 - 使用更宽松的分位数
+            q001 = stock_data[col].quantile(0.0001)  # 0.01%分位数
+            q9999 = stock_data[col].quantile(0.9999)  # 99.99%分位数
+            
+            # 检测异常值
+            outliers = (stock_data[col] < q001) | (stock_data[col] > q9999)
+            outlier_count = outliers.sum()
+            
+            if outlier_count > 0:
+                print(f"  ⚠️  {col}列发现{outlier_count}个异常值，范围[{q001:.4f}, {q9999:.4f}]")
+                
+                # 将异常值替换为分位数边界
+                stock_data.loc[stock_data[col] < q001, col] = q001
+                stock_data.loc[stock_data[col] > q9999, col] = q9999
+                print(f"  ✓ {col}列异常值已清理")
+    
+    # 2. 成交量异常值检测
+    if 'vol' in stock_data.columns:
+        q001 = stock_data['vol'].quantile(0.0001)
+        q9999 = stock_data['vol'].quantile(0.9999)
+        
+        outliers = (stock_data['vol'] < q001) | (stock_data['vol'] > q9999)
+        outlier_count = outliers.sum()
+        
+        if outlier_count > 0:
+            print(f"  ⚠️  vol列发现{outlier_count}个异常值，范围[{q001:.2e}, {q9999:.2e}]")
+            stock_data.loc[stock_data['vol'] < q001, 'vol'] = q001
+            stock_data.loc[stock_data['vol'] > q9999, 'vol'] = q9999
+            print(f"  ✓ vol列异常值已清理")
+    
+    # 3. 成交额异常值检测 - 重点处理
+    if 'amount' in stock_data.columns:
+        # 使用更保守的分位数，因为amount列异常值特别多
+        q0001 = stock_data['amount'].quantile(0.0001)  # 0.01%分位数
+        q9999 = stock_data['amount'].quantile(0.9999)  # 99.99%分位数
+        
+        outliers = (stock_data['amount'] < q0001) | (stock_data['amount'] > q9999)
+        outlier_count = outliers.sum()
+        
+        if outlier_count > 0:
+            print(f"  ⚠️  amount列发现{outlier_count}个异常值，范围[{q0001:.2e}, {q9999:.2e}]")
+            
+            # 将异常值替换为分位数边界
+            stock_data.loc[stock_data['amount'] < q0001, 'amount'] = q0001
+            stock_data.loc[stock_data['amount'] > q9999, 'amount'] = q9999
+            print(f"  ✓ amount列异常值已清理")
+    
+    # 4. 逻辑一致性检查
+    print("正在进行逻辑一致性检查...")
+    
+    # 确保 high >= low
+    if 'high' in stock_data.columns and 'low' in stock_data.columns:
+        invalid_high_low = stock_data['high'] < stock_data['low']
+        invalid_count = invalid_high_low.sum()
+        
+        if invalid_count > 0:
+            print(f"  ⚠️  发现{invalid_count}条high < low的记录")
+            # 修正：将high设为low的值
+            stock_data.loc[invalid_high_low, 'high'] = stock_data.loc[invalid_high_low, 'low']
+            print(f"  ✓ high < low记录已修正")
+    
+    # 确保 open, close 在 high, low 范围内
+    for price_col in ['open', 'close']:
+        if price_col in stock_data.columns and 'high' in stock_data.columns and 'low' in stock_data.columns:
+            too_high = stock_data[price_col] > stock_data['high']
+            too_low = stock_data[price_col] < stock_data['low']
+            invalid_count = (too_high | too_low).sum()
+            
+            if invalid_count > 0:
+                print(f"  ⚠️  发现{invalid_count}条{price_col}超出high-low范围的记录")
+                # 修正：裁剪到合理范围
+                stock_data.loc[too_high, price_col] = stock_data.loc[too_high, 'high']
+                stock_data.loc[too_low, price_col] = stock_data.loc[too_low, 'low']
+                print(f"  ✓ {price_col}超出范围记录已修正")
+    
+    print(f"✓ 数据预处理完成: {stock_data.shape}")
+    print(f"✓ 数据时间范围: {stock_data['date'].min()} 到 {stock_data['date'].max()}")
+    print(f"✓ 股票数量: {stock_data['StockID'].nunique()}")
+    
+    return stock_data
+
+def calculate_vwap(window_data):
+    """计算VWAP（成交量加权平均价格）"""
+    if 'vol' not in window_data.columns or 'close' not in window_data.columns:
+        return window_data['close'].iloc[-1]  # 回退到close价格
+    
+    # 计算VWAP: Σ(价格 × 成交量) / Σ(成交量)
+    total_volume = window_data['vol'].sum()
+    
+    if total_volume > 0:
+        vwap = (window_data['close'] * window_data['vol']).sum() / total_volume
+    else:
+        vwap = window_data['close'].iloc[-1]  # 如果没有成交量，使用收盘价
+    
+    return vwap
 
 def process_stock_data():
     """直接处理股票数据，生成训练特征 - GPU加速版本"""
@@ -72,30 +202,8 @@ def process_stock_data():
         print("✗ 无法加载原始数据")
         return False
     
-    # 数据预处理 - 与原有文件保持一致
-    print("正在预处理数据...")
-    
-    # 标准化列名
-    if 'volume' in stock_data.columns:
-        stock_data = stock_data.rename(columns={'volume': 'vol'})
-    
-    # 数据类型转换 - 与原有文件一致
-    stock_data['date'] = pd.to_datetime(stock_data['date'])
-    numeric_columns = ['open', 'high', 'low', 'close', 'vol', 'amount']
-    for col in numeric_columns:
-        stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce')
-    
-    # 删除缺失值
-    stock_data = stock_data.dropna(subset=numeric_columns)
-    stock_data = stock_data.sort_values(['StockID', 'date'])
-    
-    # 筛选时间范围：2013年至今
-    start_date = pd.to_datetime('2013-01-01')
-    stock_data = stock_data[stock_data['date'] >= start_date]
-    
-    print(f"✓ 预处理完成: {stock_data.shape}")
-    print(f"✓ 数据时间范围: {stock_data['date'].min()} 到 {stock_data['date'].max()}")
-    print(f"✓ 股票数量: {stock_data['StockID'].nunique()}")
+    # 数据预处理 - 添加异常值清理
+    stock_data = preprocess_data(stock_data)
     
     # 筛选有效股票
     stock_counts = stock_data.groupby('StockID').size()
@@ -118,6 +226,26 @@ def process_stock_data():
     features_df = pd.DataFrame(feature_records)
     features_df = features_df.sort_values(['end_date', 'StockID']).reset_index(drop=True)
     
+    # 最终数据质量检查
+    print("正在进行最终数据质量检查...")
+    
+    # 检查最终特征数据
+    for col in ['open', 'high', 'low', 'close', 'vwap', 'amount']:
+        if col in features_df.columns:
+            col_data = features_df[col].dropna()
+            if len(col_data) > 0:
+                print(f"✓ 最终{col}: min={col_data.min():.2e}, max={col_data.max():.2e}, mean={col_data.mean():.2e}")
+                
+                # 检查是否还有异常值 - 使用更宽松的标准
+                q0001 = col_data.quantile(0.0001)
+                q9999 = col_data.quantile(0.9999)
+                outlier_ratio = ((col_data < q0001) | (col_data > q9999)).mean()
+                
+                if outlier_ratio > 0.0001:  # 如果异常值超过0.01%
+                    print(f"  ⚠️  {col}仍有{outlier_ratio:.4f}的异常值")
+                else:
+                    print(f"  ✓ {col}异常值已清理完成")
+    
     # 保存到新文件
     features_df.to_csv(output_file, index=False)
     
@@ -136,7 +264,7 @@ def process_stock_data():
     return output_file
 
 def process_features_cpu(stock_data, valid_stocks):
-    """CPU处理特征生成"""
+    """CPU处理特征生成 - 改进版本"""
     print("  使用CPU处理...")
     feature_records = []
     
@@ -151,6 +279,9 @@ def process_features_cpu(stock_data, valid_stocks):
                 # 取最后一天的特征
                 last_day = window.iloc[-1]
                 
+                # 改进VWAP计算
+                vwap = calculate_vwap(window)
+                
                 record = {
                     'StockID': stock_id,
                     'end_date': last_day['date'],
@@ -158,7 +289,7 @@ def process_features_cpu(stock_data, valid_stocks):
                     'high': last_day['high'],
                     'low': last_day['low'],
                     'close': last_day['close'],
-                    'vwap': last_day['close'],  # 简化VWAP
+                    'vwap': vwap,  # 使用改进的VWAP计算
                     'amount': last_day['amount']
                 }
                 
@@ -167,7 +298,7 @@ def process_features_cpu(stock_data, valid_stocks):
     return feature_records
 
 def process_features_gpu(stock_data, valid_stocks):
-    """GPU加速处理特征生成"""
+    """GPU加速处理特征生成 - 改进版本"""
     print("  使用GPU加速处理...")
     
     # 转换为cuDF DataFrame
@@ -201,6 +332,9 @@ def process_features_gpu(stock_data, valid_stocks):
                     # 取最后一天的特征
                     last_day = window.iloc[-1]
                     
+                    # 改进VWAP计算
+                    vwap = calculate_vwap(window)
+                    
                     record = {
                         'StockID': stock_id,
                         'end_date': last_day['date'],
@@ -208,7 +342,7 @@ def process_features_gpu(stock_data, valid_stocks):
                         'high': last_day['high'],
                         'low': last_day['low'],
                         'close': last_day['close'],
-                        'vwap': last_day['close'],  # 简化VWAP
+                        'vwap': vwap,  # 使用改进的VWAP计算
                         'amount': last_day['amount']
                     }
                     

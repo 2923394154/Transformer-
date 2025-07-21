@@ -9,7 +9,7 @@
 - 标签y：个股未来10个交易日（T+1～T+11）的收益率
 - 样本内训练数据从2013年开始，每5个交易日采样一次
 - 训练集和验证集依时间先后按照4:1的比例划分
-- 损失函数：预测值与标签之间RankIC的相反数
+- 损失函数：预测值与标签之间IC的相反数 (1 - IC)
 - GPU加速：充分利用RTX 4090进行训练
 """
 
@@ -18,15 +18,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 import warnings
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import json
 import psutil
-import gc
 import argparse
 warnings.filterwarnings('ignore')
 
@@ -47,7 +45,7 @@ if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.95)  # 使用95%显存
     torch.cuda.empty_cache()  # 清空缓存
     
-    print("✓ 超高速优化已启用:")
+    print("超高速优化已启用:")
     print("  - TF32加速: 启用")
     print("  - cuDNN基准: 启用")
     print("  - 显存使用: 95%")
@@ -89,12 +87,13 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(0), :]
 
 class TransformerSeq2SeqModel(nn.Module):
-    """Encoder-Decoder结构，支持收益序列预测"""
-    def __init__(self, input_dim=6, d_model=128, nhead=8, num_layers=3, dim_feedforward=512, dropout=0.1, label_horizon=10):
+    """Encoder-Decoder结构，支持收益序列预测 - 优化版本"""
+    def __init__(self, input_dim=6, d_model=256, nhead=16, num_layers=6, dim_feedforward=1024, dropout=0.1, label_horizon=10):
         super().__init__()
         self.d_model = d_model
         self.label_horizon = label_horizon
-        # Encoder
+        
+        # Encoder - 增大容量
         self.input_embedding = nn.Linear(input_dim, d_model)
         self.pos_encoding = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -103,12 +102,14 @@ class TransformerSeq2SeqModel(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            norm_first=True
+            norm_first=True,
+            activation='gelu'  # 使用GELU激活函数
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
-        # Decoder
+        
+        # Decoder - 增大容量
         self.output_embedding = nn.Linear(1, d_model)
         self.decoder_pos_encoding = PositionalEncoding(d_model)
         decoder_layer = nn.TransformerDecoderLayer(
@@ -117,207 +118,278 @@ class TransformerSeq2SeqModel(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            norm_first=True
+            norm_first=True,
+            activation='gelu'  # 使用GELU激活函数
         )
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_layers
         )
-        self.fc_out = nn.Linear(d_model, 1)
+        
+        # 输出层 - 增加中间层
+        self.fc_hidden = nn.Linear(d_model, d_model // 2)
+        self.fc_out = nn.Linear(d_model // 2, 1)
         self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """改进的权重初始化 - 优化版本"""
+        output_layers = 0
+        embedding_layers = 0
+        other_layers = 0
+        
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'fc_out' in name:
+                    # 输出层使用极小的初始化，避免预测值过大
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)  # 减小标准差
+                    output_layers += 1
+                elif 'fc_hidden' in name:
+                    # 隐藏层使用Xavier初始化
+                    nn.init.xavier_normal_(module.weight, gain=1.0)
+                    other_layers += 1
+                elif 'output_embedding' in name or 'input_embedding' in name:
+                    # 嵌入层使用Xavier初始化，适中gain
+                    nn.init.xavier_normal_(module.weight, gain=1.0)  # 增大gain
+                    embedding_layers += 1
+                else:
+                    # 其他层使用适中的gain
+                    nn.init.xavier_normal_(module.weight, gain=1.0)
+                    other_layers += 1
+                
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        
+        print(f"权重初始化完成: 输出层{output_layers}个(std=0.1), 嵌入层{embedding_layers}个(gain=1.0), 其他层{other_layers}个(gain=1.0)")
+    
     def forward(self, src, tgt, teacher_forcing=True):
         batch_size = src.size(0)
+        
+        # Encoder
         src_emb = self.input_embedding(src) * math.sqrt(self.d_model)
         src_emb = self.pos_encoding(src_emb)
         src_emb = self.dropout(src_emb)
         memory = self.transformer_encoder(src_emb)
+        memory = self.layer_norm(memory)  # 添加层归一化
+        
         if teacher_forcing:
+            # 训练模式 - 使用teacher forcing
             start_token = torch.zeros((batch_size, 1), device=src.device)
             tgt_in = torch.cat([start_token, tgt[:, :-1]], dim=1)
+            
+            tgt_emb = self.output_embedding(tgt_in.unsqueeze(-1)) * math.sqrt(self.d_model)
+            tgt_emb = self.decoder_pos_encoding(tgt_emb)
+            tgt_emb = self.dropout(tgt_emb)
+            
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.label_horizon).to(src.device)
+            decoder_output = self.transformer_decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+            
+            # 改进的输出处理
+            hidden = self.fc_hidden(decoder_output)
+            hidden = torch.relu(hidden)  # 添加激活函数
+            hidden = self.dropout(hidden)
+            out = self.fc_out(hidden).squeeze(-1)
         else:
-            tgt_in = torch.zeros((batch_size, 1), device=src.device)
-        tgt_emb = self.output_embedding(tgt_in.unsqueeze(-1)) * math.sqrt(self.d_model)
-        tgt_emb = self.decoder_pos_encoding(tgt_emb)
-        tgt_emb = self.dropout(tgt_emb)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.label_horizon).to(src.device)
-        out = self.transformer_decoder(
-            tgt_emb, memory, tgt_mask=tgt_mask
-        )
-        out = self.fc_out(out).squeeze(-1)
+            # 推理模式 - 自回归生成
+            output = torch.zeros((batch_size, self.label_horizon), device=src.device)
+            current_input = torch.zeros((batch_size, 1), device=src.device)
+            
+            for i in range(self.label_horizon):
+                tgt_emb = self.output_embedding(current_input.unsqueeze(-1)) * math.sqrt(self.d_model)
+                tgt_emb = self.decoder_pos_encoding(tgt_emb)
+                tgt_emb = self.dropout(tgt_emb)
+                
+                # 修复掩码生成：对于自回归生成，每次只需要一个时间步的掩码
+                tgt_mask = nn.Transformer.generate_square_subsequent_mask(1).to(src.device)
+                decoder_output = self.transformer_decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+                
+                # 改进的输出处理
+                hidden = self.fc_hidden(decoder_output[:, -1:])  # [batch_size, 1, d_model//2]
+                hidden = torch.relu(hidden)
+                hidden = self.dropout(hidden)
+                next_pred = self.fc_out(hidden)  # [batch_size, 1, 1]
+                next_pred = next_pred.view(batch_size)  # 明确重塑为 [batch_size]
+                
+                output[:, i] = next_pred
+                current_input = next_pred.unsqueeze(1)  # [batch_size] -> [batch_size, 1]
+            
+            out = output
+        
         return out
-
-class TransformerFactorModel(nn.Module):
-    """
-    严格按照架构图实现的Transformer因子模型
-    包含：Input Embedding → Positional Encoding → Multi-Head Attention → Feed Forward → FC
-    """
-    
-    def __init__(self, input_dim=6, d_model=128, nhead=8, num_layers=3, dim_feedforward=512, dropout=0.1):
-        super(TransformerFactorModel, self).__init__()
-        
-        self.d_model = d_model
-        
-        # Input Embedding
-        self.input_embedding = nn.Linear(input_dim, d_model)
-        
-        # Positional Encoding
-        self.pos_encoding = PositionalEncoding(d_model)
-        
-        # Transformer Encoder (仅使用encoder，如架构图所示)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True
-        )
-        
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=num_layers,
-        )
-        
-        # FC: 全连接输出层
-        self.fc = nn.Linear(d_model, 1)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, src):
-        """
-        Args:
-            src: (batch_size, seq_len=40, input_dim=6)
-        
-        Returns:
-            prediction: (batch_size,) 未来10日收益率预测
-        """
-        # Input Embedding
-        src = self.input_embedding(src) * math.sqrt(self.d_model)
-        
-        # Positional Encoding
-        batch_size, seq_len, _ = src.shape
-        pos_encoding = self.pos_encoding.pe[:seq_len, 0, :].unsqueeze(0).expand(batch_size, -1, -1)
-        src = src + pos_encoding
-        src = self.dropout(src)
-        
-        # Multi-Head Attention & Feed Forward (Transformer Encoder)
-        output = self.transformer_encoder(src)
-        
-        # 使用最后一个时间步的输出
-        last_output = output[:, -1, :]  # (batch_size, d_model)
-        
-        # FC: 全连接输出
-        prediction = self.fc(last_output)  # (batch_size, 1)
-        
-        return prediction.squeeze(-1)  # (batch_size,)
-
-def rankic_loss_function(predictions, targets):
-    """
-    高效的RankIC损失函数：使用排序损失直接优化RankIC
-    predictions: (batch, seq_len)
-    targets: (batch, seq_len)
-    """
-    # 主要损失：排序一致性损失
-    rank_loss = 0
-    for t in range(predictions.shape[1]):
-        pred = predictions[:, t]
-        true = targets[:, t]
-        
-        # 计算排序损失：使用成对比较
-        pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)  # (batch, batch)
-        true_diff = true.unsqueeze(1) - true.unsqueeze(0)  # (batch, batch)
-        
-        # 排序一致性：预测的排序应该与真实值的排序一致
-        pred_sign = torch.sign(pred_diff)
-        true_sign = torch.sign(true_diff)
-        
-        # 排序不一致的损失
-        sign_diff = torch.abs(pred_sign - true_sign)
-        rank_loss += torch.mean(sign_diff)
-    
-    rank_loss = rank_loss / predictions.shape[1]
-    
-    # 添加MSE损失作为正则化
-    mse_loss = torch.nn.functional.mse_loss(predictions, targets)
-    
-    # 组合损失：主要使用排序损失，少量MSE正则化
-    total_loss = rank_loss + 0.01 * mse_loss
-    
-    return total_loss
 
 def ic_loss_function(predictions, targets):
     """
-    优化的IC损失函数：直接优化IC，添加稳定性改进
-    predictions: (batch, seq_len)
-    targets: (batch, seq_len)
+    稳定的IC损失函数 - 防止梯度爆炸
+    损失 = 1 - 平均IC + 预测值范围惩罚
     """
+    # 输入检查
+    if torch.isnan(predictions).any() or torch.isinf(predictions).any():
+        return torch.tensor(1.0, device=predictions.device, requires_grad=True)
+    
+    if torch.isnan(targets).any() or torch.isinf(targets).any():
+        return torch.tensor(1.0, device=predictions.device, requires_grad=True)
+    
+    # 预测值范围惩罚 - 防止预测值过大
+    pred_range = torch.max(predictions) - torch.min(predictions)
+    range_penalty = torch.clamp(pred_range - 1.0, min=0.0) * 0.1  # 惩罚超过1.0的范围
+    
+    # 计算T+1到T+6的平均IC
     ic_list = []
-    for t in range(predictions.shape[1]):
+    
+    for t in range(min(6, predictions.shape[1])):
         pred = predictions[:, t]
         true = targets[:, t]
         
-        # 标准化 - 使用更稳定的方法
-        pred_mean = pred.mean()
-        pred_std = pred.std() + 1e-8
-        true_mean = true.mean()
-        true_std = true.std() + 1e-8
+        # 过滤有效数据
+        valid_mask = ~(torch.isnan(pred) | torch.isnan(true) | torch.isinf(pred) | torch.isinf(true))
+        if valid_mask.sum() < 10:  # 至少需要10个有效样本
+            continue
         
-        pred_norm = (pred - pred_mean) / pred_std
-        true_norm = (true - true_mean) / true_std
+        pred_valid = pred[valid_mask]
+        true_valid = true[valid_mask]
         
-        # 计算IC - 使用更稳定的方法
-        numerator = torch.sum(pred_norm * true_norm)
-        denominator = torch.sqrt(torch.sum(pred_norm ** 2) * torch.sum(true_norm ** 2))
+        # 计算均值和标准差
+        pred_mean = pred_valid.mean()
+        pred_std = pred_valid.std()
+        true_mean = true_valid.mean()
+        true_std = true_valid.std()
         
-        ic = numerator / (denominator + 1e-8)
+        # 数值稳定性检查
+        epsilon = 1e-6
+        if pred_std < epsilon or true_std < epsilon:
+            continue
+        
+        # 标准化
+        pred_norm = (pred_valid - pred_mean) / torch.clamp(pred_std, min=epsilon)
+        true_norm = (true_valid - true_mean) / torch.clamp(true_std, min=epsilon)
+        
+        # 计算皮尔逊相关系数
+        covariance = torch.mean(pred_norm * true_norm)
+        
+        # 裁剪IC值到合理范围
+        ic = torch.clamp(covariance, -1.0, 1.0)
         ic_list.append(ic)
     
-    # 返回IC的相反数作为损失，添加平滑处理
-    avg_ic = torch.mean(torch.stack(ic_list))
-    loss = 1 - avg_ic
+    # 如果没有有效的IC计算，返回默认损失
+    if len(ic_list) == 0:
+        return torch.tensor(1.0, device=predictions.device, requires_grad=True)
     
-    # 添加正则化项，防止损失过大
-    loss = torch.clamp(loss, min=0.0, max=2.0)
+    # 计算平均IC
+    avg_ic = torch.mean(torch.stack(ic_list))
+    
+    # 基础损失：IC的相反数
+    base_loss = 1.0 - avg_ic
+    
+    # 添加范围惩罚
+    loss = base_loss + range_penalty
+    
+    # 数值稳定性处理
+    loss = torch.clamp(loss, 0.0, 2.0)
+    
+    # 最终安全检查
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(1.0, device=predictions.device, requires_grad=True)
     
     return loss
 
 class TransformerFactorTrainer:
     """Transformer因子训练器 - 直接数据版本"""
     
-    def __init__(self, model_config, max_stocks=500):
+    def __init__(self, model_config, max_stocks=None):
         self.model_config = model_config
         self.max_stocks = max_stocks
         self.device = device
+        self.current_epoch = 0
         
-        # 初始化模型
-        self.model = TransformerSeq2SeqModel(**model_config['model_params']).to(self.device)
+        # 创建模型
+        self.model = TransformerSeq2SeqModel(**model_config).to(self.device)
+        
+        # 优化器 - 降低学习率避免梯度爆炸
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=5e-5,  # 降低学习率避免梯度爆炸
+            weight_decay=1e-3,  # 增加权重衰减防止过拟合
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        
+        # 学习率调度器 - 使用余弦退火
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=20,  # 每20个epoch重启一次
+            T_mult=2,  # 重启后周期翻倍
+            eta_min=1e-6  # 最小学习率
+        )
+        
+        # 训练配置优化 - 速度优化版本
+        self.batch_size = 2048  # 增大批次大小，提高GPU利用率
+        self.num_epochs = 100   # 减少epoch数量，加快训练
+        
+        print(f"模型配置: d_model={model_config['d_model']}, layers={model_config['num_layers']}")
+        print(f"优化器: AdamW(lr={5e-5}, weight_decay={1e-3})")
+        print(f"调度器: CosineAnnealingWarmRestarts(T_0=20)")
+        print(f"批次大小: {self.batch_size}, 训练轮数: {self.num_epochs}")
         
         # 确保所有参数都需要梯度
         for param in self.model.parameters():
             param.requires_grad = True
         
-        # 初始化优化器和调度器
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=model_config['training_params']['learning_rate'],
-            weight_decay=model_config['training_params']['weight_decay']
-        )
+        # 初始化模型权重
+        self._initialize_weights()
         
-        # 使用更有效的学习率调度器
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=10,
-            T_mult=2,
-            eta_min=1e-6
-        )
+        # 改进的学习率调度器：更激进的衰减
+        # self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     self.optimizer,
+        #     max_lr=model_config['training_params']['learning_rate'] * 2,  # 峰值学习率
+        #     epochs=model_config['training_params']['num_epochs'],
+        #     steps_per_epoch=300,  # 预估每epoch步数
+        #     pct_start=0.3,  # 30%时间内升到峰值
+        #     anneal_strategy='cos',
+        #     div_factor=10.0,  # 初始lr = max_lr / div_factor
+        #     final_div_factor=1000.0  # 最终lr = max_lr / final_div_factor
+        # )
         
-        # 启用混合精度训练
-        self.scaler = torch.cuda.amp.GradScaler()
+        # 禁用混合精度训练以避免GradScaler问题
+        self.use_amp = False
+        self.scaler = None
         
-        print(f"✓ 模型初始化完成")
-        print(f"✓ 设备: {self.device}")
-        print(f"✓ 混合精度训练: {'启用' if torch.cuda.is_available() else '禁用'}")
+        print(f"模型初始化完成")
+        print(f"设备: {self.device}")
+        print(f"混合精度训练: 禁用（避免GradScaler问题）")
+    
+    def _initialize_weights(self):
+        """模型权重初始化 - 修复预测方差过小问题"""
+        output_layers = 0
+        embedding_layers = 0
+        other_layers = 0
+        
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'fc_out' in name:
+                    nn.init.normal_(module.weight, mean=0.0, std=0.001)  # 极小标准差，避免梯度爆炸
+                    output_layers += 1
+                elif any(embed_name in name for embed_name in ['embedding', 'pos_encoding']):
+                    nn.init.xavier_normal_(module.weight, gain=0.5)  # 适中的嵌入层gain
+                    embedding_layers += 1
+                else:
+                    nn.init.xavier_normal_(module.weight, gain=1.0)  # 标准的其他层gain
+                    other_layers += 1
+                
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        
+        print(f"训练器权重初始化完成: 输出层{output_layers}个, 嵌入层{embedding_layers}个, 其他层{other_layers}个")
     
     def load_direct_data(self, data_file='direct_features_latest.csv'):
-        """超高速加载直接处理的数据"""
+        """加载直接处理的数据"""
         print("="*50)
         print("加载直接处理的数据")
         print("="*50)
@@ -328,44 +400,36 @@ class TransformerFactorTrainer:
         
         # 检查数据文件
         if not os.path.exists(data_file):
-            print(f"✗ 数据文件不存在: {data_file}")
+            print(f"数据文件不存在: {data_file}")
             print("请先运行: python simple_direct_processing.py")
             return None
         
-        # 超高速加载特征数据 - 使用内存映射
-        print(f"正在超高速加载特征数据: {data_file}")
+        # 加载特征数据
+        print(f"正在加载特征数据: {data_file}")
         try:
-            # 使用更高效的数据加载方式
             features_df = pd.read_csv(data_file, engine='c', memory_map=True)
             features_df['end_date'] = pd.to_datetime(features_df['end_date'])
-            
-            # 优化数据类型以减少内存使用
             features_df['StockID'] = features_df['StockID'].astype('category')
             
-            print(f"✓ 特征数据加载成功: {features_df.shape}")
-            print(f"✓ 股票数量: {features_df['StockID'].nunique()}")
-            print(f"✓ 时间范围: {features_df['end_date'].min()} ~ {features_df['end_date'].max()}")
-            print(f"✓ 内存优化: 启用")
+            print(f"特征数据加载成功: {features_df.shape}")
+            print(f"股票数量: {features_df['StockID'].nunique()}")
+            print(f"时间范围: {features_df['end_date'].min()} ~ {features_df['end_date'].max()}")
         except Exception as e:
-            print(f"✗ 特征数据加载失败: {e}")
+            print(f"特征数据加载失败: {e}")
             return None
         
         print(f"特征数据加载后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
         
-        # 超高速加载股票价格数据
-        print("正在超高速加载股票价格数据...")
+        # 加载股票价格数据
+        print("正在加载股票价格数据...")
         try:
-            # 使用feather格式读取
             stock_data = pd.read_feather('stock_price_vol_d.txt')
             stock_data['date'] = pd.to_datetime(stock_data['date'])
-            
-            # 优化数据类型
             stock_data['StockID'] = stock_data['StockID'].astype('category')
             
-            print(f"✓ 价格数据加载成功: {stock_data.shape}")
-            print(f"✓ 内存优化: 启用")
+            print(f"价格数据加载成功: {stock_data.shape}")
         except Exception as e:
-            print(f"✗ 价格数据加载失败: {e}")
+            print(f"价格数据加载失败: {e}")
             return None
         
         print(f"价格数据加载后内存: {process.memory_info().rss / 1024 / 1024 / 1024:.2f} GB")
@@ -373,38 +437,51 @@ class TransformerFactorTrainer:
         return features_df, stock_data
     
     def process_features_and_labels(self, features_df, stock_data, sampling_interval=5):
-        """超高速构建训练数据 - 向量化优化"""
-        print("正在超高速构建训练数据...")
+        """构建训练数据"""
+        print("正在构建训练数据...")
         feature_cols = ['open', 'high', 'low', 'close', 'vwap', 'amount']
         seq_len = 40
         label_horizon = 10
         
-        # 预排序 - 使用更高效的方式
-        print("✓ 预排序数据...")
+        # 预排序
+        print("预排序数据...")
         features_df = features_df.sort_values(['StockID', 'end_date']).reset_index(drop=True)
         stock_data = stock_data.sort_values(['StockID', 'date']).reset_index(drop=True)
         
-        # 筛选有效股票 - 向量化操作
-        print("✓ 筛选有效股票...")
+        # 筛选有效股票
+        print("筛选有效股票...")
         stock_counts = features_df['StockID'].value_counts()
         valid_stocks = stock_counts[stock_counts >= 30].index.tolist()
         
-        print(f"✓ 有效股票数量: {len(valid_stocks)} 只")
+        print(f"有效股票数量: {len(valid_stocks)} 只")
         
-        # 保留所有有效股票，不进行数量限制（除非max_stocks设置得很小）
-        if self.max_stocks is not None and self.max_stocks < 100:
-            # 只有当max_stocks小于100时才进行限制，按成交量排序选择最佳股票
-            stock_volumes = features_df.groupby('StockID')['amount'].mean().sort_values(ascending=False)
-            valid_stocks = [stock for stock in stock_volumes.index if stock in valid_stocks][:self.max_stocks]
-            print(f"⚠️  应用严格股票数量限制: {len(stock_volumes)} → {self.max_stocks} 只")
+        # 添加数据范围统计
+        print(f"特征数据时间范围: {features_df['end_date'].min()} ~ {features_df['end_date'].max()}")
+        print(f"特征数据总记录数: {len(features_df):,}")
+        print(f"价格数据时间范围: {stock_data['date'].min()} ~ {stock_data['date'].max()}")
+        print(f"价格数据总记录数: {len(stock_data):,}")
+        
+        if self.max_stocks:
+            print(f"应用股票数量限制: {len(valid_stocks)} → {self.max_stocks}")
+            valid_stocks = valid_stocks[:self.max_stocks]
+            print(f"限制使用前{self.max_stocks}只股票进行训练")
         else:
-            print(f"✓ 保留所有{len(valid_stocks)}只有效股票进行训练")
+            print(f"使用所有{len(valid_stocks)}只有效股票进行训练")
         
-        # 预分配内存 - 大幅提升性能
-        print("✓ 预分配内存...")
+        # 预分配内存
+        print("预分配内存...")
         max_samples = sum(len(features_df[features_df['StockID'] == stock]) - seq_len - label_horizon + 1 
                          for stock in valid_stocks) // sampling_interval
-        max_samples = min(max_samples, 1000000)  # 限制最大样本数
+        
+        # 增加数据量限制并添加统计信息
+        original_max_samples = max_samples
+        max_samples = min(max_samples, 5000000)  # 增加到500万样本
+        
+        print(f"预估样本数: {original_max_samples:,}")
+        print(f"实际预分配: {max_samples:,}")
+        print(f"采样间隔: {sampling_interval}天")
+        if original_max_samples > 5000000:
+            print(f"数据量被限制：{original_max_samples:,} → {max_samples:,}")
         
         features_array = np.zeros((max_samples, seq_len, len(feature_cols)), dtype=np.float32)
         labels_array = np.zeros((max_samples, label_horizon), dtype=np.float32)
@@ -412,20 +489,20 @@ class TransformerFactorTrainer:
         
         sample_idx = 0
         
-        # 向量化处理每只股票
-        for stock_id in tqdm(valid_stocks, desc="超高速处理股票"):
+        # 处理每只股票
+        for stock_id in tqdm(valid_stocks, desc="处理股票"):
             stock_features = features_df[features_df['StockID'] == stock_id]
             stock_prices = stock_data[stock_data['StockID'] == stock_id]
             
             if len(stock_features) < seq_len + label_horizon or len(stock_prices) < seq_len + label_horizon:
                 continue
             
-            # 创建日期映射 - 使用numpy操作
+            # 创建日期映射
             price_dates = stock_prices['date'].values
             price_close = stock_prices['close'].values
             date_to_idx = {date: idx for idx, date in enumerate(price_dates)}
             
-            # 向量化处理时间窗口
+            # 处理时间窗口
             feature_values = stock_features[feature_cols].values
             feature_dates = stock_features['end_date'].values
             
@@ -433,30 +510,42 @@ class TransformerFactorTrainer:
                 if sample_idx >= max_samples:
                     break
                     
-                # 特征序列 - 直接切片
+                # 特征序列: T-40到T-1
                 feature_seq = feature_values[i:i+seq_len]
                 
-                # 标签序列
-                label_end_date = feature_dates[i+seq_len-1]
-                if label_end_date not in date_to_idx:
+                # 关键修复：标签序列应该是T+1到T+10的收益率
+                # 特征序列的最后一天是T-1，所以T0是下一天
+                feature_end_date = feature_dates[i+seq_len-1]  # T-1
+                if feature_end_date not in date_to_idx:
                     continue
                     
-                label_start_idx = date_to_idx[label_end_date]
-                if label_start_idx + label_horizon >= len(price_close):
+                feature_end_idx = date_to_idx[feature_end_date]  # T-1在价格数据中的索引
+                
+                # T0应该是feature_end_idx + 1
+                t0_idx = feature_end_idx + 1
+                
+                # 确保有足够的未来数据：需要T0到T+10的价格数据
+                if t0_idx + label_horizon >= len(price_close):
                     continue
                 
-                # 计算未来10天收益 - 向量化
-                future_prices = price_close[label_start_idx:label_start_idx+label_horizon+1]
+                # 计算T+1到T+10的收益率
+                # T0到T+10的价格
+                future_prices = price_close[t0_idx:t0_idx+label_horizon+1]
+                # T+1到T+10的收益率：(T+1价格-T0价格)/T0价格, ..., (T+10价格-T+9价格)/T+9价格
                 returns = (future_prices[1:] - future_prices[:-1]) / future_prices[:-1]
                 
-                # 直接赋值到预分配数组
+                # 验证数组长度
+                if len(returns) != label_horizon:
+                    continue
+                
+                # 赋值到预分配数组
                 features_array[sample_idx] = feature_seq
                 labels_array[sample_idx] = returns
-                dates_array[sample_idx] = label_end_date
+                dates_array[sample_idx] = feature_end_date  # 记录特征序列的结束日期(T-1)
                 sample_idx += 1
         
         if sample_idx == 0:
-            print("✗ 没有找到有效数据")
+            print("没有找到有效数据")
             return None, None, None
             
         # 裁剪到实际大小
@@ -464,114 +553,165 @@ class TransformerFactorTrainer:
         labels = labels_array[:sample_idx]
         dates = dates_array[:sample_idx]
         
-        print(f"✓ 最终数据形状: {features.shape}")
-        print(f"✓ 标签形状: {labels.shape}")
-        print(f"✓ 内存优化: 预分配 + 向量化")
+        print(f"最终数据形状: {features.shape}")
+        print(f"标签形状: {labels.shape}")
         
         return features, labels, dates
     
-    def create_data_loaders(self, data, batch_size=2048):
-        """超高速创建数据加载器 - 多进程优化"""
+    def create_data_loaders(self, data, batch_size=2048, use_cache=True):
+        """创建数据加载器"""
         features, labels, dates = data
         
-        # 数据标准化 - 使用GPU加速
-        print("正在进行超高速数据标准化...")
-        scaler = StandardScaler()
-        features_reshaped = features.reshape(-1, features.shape[-1])
-        features_scaled = scaler.fit_transform(features_reshaped)
-        features = features_scaled.reshape(features.shape)
+        # 按时间分割数据
+        print("正在进行时间序列数据分割...")
         
-        # 数据分割 - 严格按照时间顺序4:1分割
+        # 确保数据按时间排序
+        sorted_indices = np.argsort(dates)
+        features = features[sorted_indices]
+        labels = labels[sorted_indices]
+        dates = dates[sorted_indices]
+        
+        # 按时间顺序4:1分割
         split_idx = int(0.8 * len(features))
         train_features = features[:split_idx]
         train_labels = labels[:split_idx]
+        train_dates = dates[:split_idx]
         val_features = features[split_idx:]
         val_labels = labels[split_idx:]
+        val_dates = dates[split_idx:]
         
-        print(f"✓ 训练集大小: {train_features.shape}")
-        print(f"✓ 验证集大小: {val_features.shape}")
+        print(f"训练集时间范围: {train_dates.min()} ~ {train_dates.max()}")
+        print(f"验证集时间范围: {val_dates.min()} ~ {val_dates.max()}")
+        
+        # 滚动窗口标准化
+        print("正在进行滚动窗口标准化...")
+        
+        # 尝试使用UltraFastRollingScaler
+        try:
+            from ultra_fast_scaler import UltraFastRollingScaler
+            rolling_scaler = UltraFastRollingScaler(window_size=252)
+            print("使用终极超高速标准化器（JIT加速）")
+        except ImportError:
+            print("使用简单标准化（Numba未安装）")
+            # 简单的全局标准化作为后备
+            train_features_scaled = (train_features - np.mean(train_features, axis=(0,1), keepdims=True)) / (np.std(train_features, axis=(0,1), keepdims=True) + 1e-8)
+            val_features_scaled = (val_features - np.mean(train_features, axis=(0,1), keepdims=True)) / (np.std(train_features, axis=(0,1), keepdims=True) + 1e-8)
+            
+            # 创建一个简单的scaler对象
+            class SimpleScaler:
+                def __init__(self):
+                    self.is_fitted = True
+            
+            rolling_scaler = SimpleScaler()
+            train_features_scaled = np.clip(train_features_scaled, -3, 3)
+            val_features_scaled = np.clip(val_features_scaled, -3, 3)
+        else:
+            # 使用UltraFastRollingScaler - 智能选择标准化策略
+            data_size_mb = train_features.size * 4 / (1024 * 1024)  # 4字节每个float32
+            print(f"数据规模: {train_features.size:,} 元素 ({data_size_mb:.1f} MB)")
+            
+            # 如果数据超过500MB，使用简单模式提高速度
+            if data_size_mb > 500:
+                print("数据量较大，使用快速简单标准化模式")
+                use_simple = True
+            else:
+                print("使用滚动窗口标准化模式")
+                use_simple = False
+            
+            train_features_scaled = rolling_scaler.fit_transform(
+                train_features, train_dates, use_cache=use_cache, use_simple=use_simple
+            )
+            val_features_scaled = rolling_scaler.transform(
+                val_features, val_dates, use_simple=use_simple
+            )
+        
+        print(f"训练集大小: {train_features.shape}")
+        print(f"验证集大小: {val_features.shape}")
         
         # 创建数据集
-        train_dataset = FactorDataset(train_features, train_labels)
-        val_dataset = FactorDataset(val_features, val_labels)
+        train_dataset = FactorDataset(train_features_scaled, train_labels)
+        val_dataset = FactorDataset(val_features_scaled, val_labels)
         
-        # 创建超高速数据加载器 - 多进程 + 内存优化
+        # 创建数据加载器 - 速度优化版本
         train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True,
-            num_workers=4,  # 多进程加载
-            pin_memory=True,  # 内存优化
-            persistent_workers=True,  # 保持工作进程
-            prefetch_factor=2  # 预取因子
+            num_workers=8,  # 增加工作进程数
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,  # 增加预取因子
+            drop_last=True  # 丢弃不完整的批次
         )
         val_loader = DataLoader(
             val_dataset, 
             batch_size=batch_size, 
             shuffle=False,
-            num_workers=4,  # 多进程加载
-            pin_memory=True,  # 内存优化
-            persistent_workers=True,  # 保持工作进程
-            prefetch_factor=2  # 预取因子
+            num_workers=8,  # 增加工作进程数
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,  # 增加预取因子
+            drop_last=True  # 丢弃不完整的批次
         )
         
-        print("✓ 超高速数据加载器配置:")
-        print("  - 多进程加载: 4个进程")
-        print("  - 内存优化: pin_memory=True")
-        print("  - 持久化工作进程: 启用")
-        print("  - 预取因子: 2")
+        print("数据加载器配置完成")
         
-        return train_loader, val_loader, scaler
+        return train_loader, val_loader, rolling_scaler
     
     def train_epoch(self, train_loader):
-        """超高速训练一个epoch - 极致GPU加速"""
+        """训练一个epoch - 速度优化版本"""
         self.model.train()
         total_loss = 0
         num_batches = 0
         
-        # 启用CUDA图优化（如果可用）
-        if hasattr(torch, 'compile'):
-            try:
-                self.model = torch.compile(self.model, mode="max-autotune")
-                print("✓ PyTorch 2.0编译优化已启用")
-            except:
-                pass
+        # 启用PyTorch编译优化 - 只在第一次调用时编译
+        if not hasattr(self, '_model_compiled'):
+            if hasattr(torch, 'compile'):
+                try:
+                    self.model = torch.compile(self.model, mode="max-autotune")
+                    self._model_compiled = True
+                    print("PyTorch 2.0编译优化已启用")
+                except:
+                    self._model_compiled = True
+            else:
+                self._model_compiled = True
         
-        for batch_features, batch_labels in tqdm(train_loader, desc="超高速训练"):
+        # 简化训练循环，移除不必要的数据增强
+        for batch_features, batch_labels in tqdm(train_loader, desc="训练"):
             batch_features = batch_features.to(self.device, non_blocking=True)
             batch_labels = batch_labels.to(self.device, non_blocking=True)
             
-            self.optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+            # 清零梯度
+            self.optimizer.zero_grad(set_to_none=True)
             
-            # 使用混合精度训练
-            with torch.cuda.amp.autocast():
-                predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
-                # 损失函数：预测值与标签之间IC的相反数
-                loss = ic_loss_function(predictions, batch_labels)
+            # 前向传播
+            predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
+            loss = ic_loss_function(predictions, batch_labels)
                 
-
+            # 检查损失是否有效
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
             
             # 反向传播
-            self.scaler.scale(loss).backward()
+            loss.backward()
             
-            # 梯度裁剪
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # 更严格的梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
             
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # 参数更新
+            self.optimizer.step()
             
             total_loss += loss.item()
             num_batches += 1
             
-            # 定期清理缓存
-            if num_batches % 10 == 0:
+            # 减少缓存清理频率
+            if num_batches % 50 == 0:
                 torch.cuda.empty_cache()
         
-        return total_loss / num_batches
+        return total_loss / num_batches if num_batches > 0 else 0.0
     
     def validate(self, val_loader):
-        """验证 - GPU加速版本，同时计算损失和RankIC值"""
+        """验证 - 速度优化版本"""
         self.model.eval()
         total_loss = 0
         num_batches = 0
@@ -583,11 +723,9 @@ class TransformerFactorTrainer:
                 batch_features = batch_features.to(self.device, non_blocking=True)
                 batch_labels = batch_labels.to(self.device, non_blocking=True)
                 
-                with torch.cuda.amp.autocast():
-                    # 修复：验证时也使用teacher_forcing=True，避免掩码问题
-                    predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
-                    # 损失函数：预测值与标签之间IC的相反数
-                    loss = ic_loss_function(predictions, batch_labels)
+                # 验证 - 使用teacher forcing模式，避免自回归的慢速推理
+                predictions = self.model(batch_features, batch_labels, teacher_forcing=True)
+                loss = ic_loss_function(predictions, batch_labels)
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -595,95 +733,286 @@ class TransformerFactorTrainer:
                 # 收集预测和标签用于计算IC
                 all_predictions.append(predictions.cpu().numpy())
                 all_labels.append(batch_labels.cpu().numpy())
+                
+                # 简化统计信息，只在第一个epoch显示
+                if num_batches == 1 and getattr(self, 'current_epoch', 0) == 0:
+                    pred_std = predictions.std().item()
+                    print(f"验证批次统计: 预测范围[{predictions.min():.6f}, {predictions.max():.6f}], 标准差{pred_std:.6f}")
         
         # 计算平均损失
         avg_loss = total_loss / num_batches
         
-        # 计算RankIC值
+        # 计算IC值
         if all_predictions and all_labels:
             all_preds = np.concatenate(all_predictions, axis=0)
             all_labs = np.concatenate(all_labels, axis=0)
             
-            # 计算序列RankIC：对每一天的预测与真实收益分别计算RankIC，最后取平均
-            rankic_list = []
-            for t in range(all_preds.shape[1]):
-                pred = all_preds[:, t]
-                true = all_labs[:, t]
-                
-                # 手动计算RankIC
-                pred_rank = np.argsort(np.argsort(pred))
-                true_rank = np.argsort(np.argsort(true))
-                
-                # 标准化排名
-                pred_rank_norm = (pred_rank - pred_rank.mean()) / (pred_rank.std() + 1e-8)
-                true_rank_norm = (true_rank - true_rank.mean()) / (true_rank.std() + 1e-8)
-                
-                # 计算相关系数
-                rankic = np.corrcoef(pred_rank_norm, true_rank_norm)[0, 1]
-                if np.isnan(rankic):
-                    rankic = 0.0
-                rankic_list.append(rankic)
+            # 处理异常值 - 添加详细统计
+            nan_count = np.isnan(all_preds).sum()
+            inf_count = np.isinf(all_preds).sum()
+            total_elements = all_preds.size
+            valid_elements = total_elements - nan_count - inf_count
             
-            avg_rankic = np.mean(rankic_list) if rankic_list else 0.0
+            print(f"预测值统计:")
+            print(f"  总元素数: {total_elements}")
+            print(f"  有效元素: {valid_elements} ({valid_elements/total_elements:.2%})")
+            print(f"  NaN数量: {nan_count} ({nan_count/total_elements:.2%})")
+            print(f"  Inf数量: {inf_count} ({inf_count/total_elements:.2%})")
+            
+            if valid_elements > 0:
+                valid_mask = ~(np.isnan(all_preds) | np.isinf(all_preds))
+                valid_preds = all_preds[valid_mask]
+                
+                # 数值稳定性处理：移除极值
+                try:
+                    # 先尝试直接使用所有有效预测值
+                    pred_min = valid_preds.min()
+                    pred_max = valid_preds.max()
+                    pred_mean = valid_preds.mean()
+                    pred_std = valid_preds.std()
+                    
+                    # 如果数据范围过大，再考虑移除极值
+                    if pred_max - pred_min > 1000:  # 范围超过1000时才移除极值
+                        q01 = np.percentile(valid_preds, 1)
+                        q99 = np.percentile(valid_preds, 99)
+                        filtered_preds = valid_preds[(valid_preds >= q01) & (valid_preds <= q99)]
+                        
+                        if len(filtered_preds) > len(valid_preds) * 0.5:  # 至少保留50%的数据
+                            pred_min = filtered_preds.min()
+                            pred_max = filtered_preds.max()
+                            pred_mean = filtered_preds.mean()
+                            pred_std = filtered_preds.std()
+                            print(f"  已移除极值，保留 {len(filtered_preds)}/{len(valid_preds)} 个预测值")
+                    
+                    # 检查std是否异常
+                    if np.isnan(pred_std) or np.isinf(pred_std):
+                        pred_std = 0.0
+                    
+                    print(f"  有效预测值范围: [{pred_min:.6f}, {pred_max:.6f}]")
+                    print(f"  有效预测值std: {pred_std:.6f}")
+                    print(f"  有效预测值mean: {pred_mean:.6f}")
+                        
+                except Exception as e:
+                    print(f"  预测值统计计算失败: {e}")
+                    # 使用最基本的统计
+                    try:
+                        print(f"  有效预测值范围: [{valid_preds.min():.6f}, {valid_preds.max():.6f}]")
+                        print(f"  有效预测值std: {valid_preds.std():.6f}")
+                        print(f"  有效预测值mean: {valid_preds.mean():.6f}")
+                    except:
+                        print(f"  有效预测值范围: [计算失败]")
+                        print(f"  有效预测值std: 0.000000")
+                        print(f"  有效预测值mean: 0.000000")
+                
+                # 检查是否所有有效预测值都相同
+                try:
+                    unique_values = np.unique(valid_preds)
+                    print(f"  唯一值数量: {len(unique_values)}")
+                    if len(unique_values) <= 5:
+                        print(f"  唯一值: {unique_values}")
+                except:
+                    print(f"  唯一值数量: 计算失败")
+            
+            if nan_count > 0 or inf_count > 0:
+                all_preds = np.where(np.isnan(all_preds) | np.isinf(all_preds), 0.0, all_preds)
+                print(f"异常值已清理为0.0")
+            
+            # 计算标准差 - 改进版本
+            try:
+                clean_preds = all_preds.copy()
+                clean_preds = np.where(np.isnan(clean_preds) | np.isinf(clean_preds), 0.0, clean_preds)
+                
+                # 直接计算标准差，除非数据量太少
+                if len(clean_preds) > 10:
+                    pred_std = np.std(clean_preds)
+                    
+                    # 如果标准差过大，考虑移除极值
+                    if pred_std > 100:  # 标准差过大时才考虑移除极值
+                        try:
+                            q01 = np.percentile(clean_preds, 1)
+                            q99 = np.percentile(clean_preds, 99)
+                            filtered_clean_preds = clean_preds[(clean_preds >= q01) & (clean_preds <= q99)]
+                            
+                            if len(filtered_clean_preds) > len(clean_preds) * 0.5:  # 至少保留50%数据
+                                filtered_std = np.std(filtered_clean_preds)
+                                if filtered_std < pred_std * 0.8:  # 如果移除极值后标准差明显减小
+                                    pred_std = filtered_std
+                                    print(f"移除极值后标准差: {pred_std:.6f}")
+                        except:
+                            pass  # 如果极值移除失败，使用原始标准差
+                    
+                    # 检查标准差是否异常
+                    if np.isnan(pred_std) or np.isinf(pred_std):
+                        pred_std = 1e-6
+                        print(f"标准差计算异常，使用默认值")
+                    elif pred_std < 1e-8:
+                        print(f"预测标准差过小: {pred_std:.2e}")
+                        pred_std = 1e-6
+                else:
+                    print(f"数据量太少（{len(clean_preds)}），无法计算可靠的标准差")
+                    pred_std = 1e-6
+            except Exception as e:
+                print(f"标准差计算出错: {e}")
+                pred_std = 1e-6
+            
+            try:
+                clean_labs = all_labs.copy()
+                clean_labs = np.where(np.isnan(clean_labs) | np.isinf(clean_labs), 0.0, clean_labs)
+                lab_std = np.std(clean_labs)
+                if np.isnan(lab_std) or np.isinf(lab_std):
+                    lab_std = 0.0
+            except:
+                lab_std = 0.0
+            
+            print(f"验证统计: 预测std={pred_std:.6f}, 标签std={lab_std:.6f}")
+            
+            # 计算IC
+            if pred_std < 1e-8:
+                print(f"预测值方差过小 ({pred_std:.2e})，IC计算可能无效")
+                avg_ic = 0.0
+            else:
+                ic_list = []
+                
+                for t in range(all_preds.shape[1]):
+                    pred = all_preds[:, t]
+                    true = all_labs[:, t]
+                    
+                    # 清理异常值
+                    pred = np.where(np.isnan(pred) | np.isinf(pred), 0.0, pred)
+                    true = np.where(np.isnan(true) | np.isinf(true), 0.0, true)
+                    
+                    # 计算统计量
+                    try:
+                        pred_mean = np.mean(pred)
+                        pred_std = np.std(pred)
+                        true_mean = np.mean(true)
+                        true_std = np.std(true)
+                        
+                        if np.isnan(pred_mean) or np.isnan(pred_std) or np.isinf(pred_mean) or np.isinf(pred_std):
+                            pred_mean, pred_std = 0.0, 1.0
+                        if np.isnan(true_mean) or np.isnan(true_std) or np.isinf(true_mean) or np.isinf(true_std):
+                            true_mean, true_std = 0.0, 1.0
+                    except:
+                        pred_mean, pred_std = 0.0, 1.0
+                        true_mean, true_std = 0.0, 1.0
+                    
+                    # 检查数值稳定性
+                    if pred_std < 1e-8 or true_std < 1e-8:
+                        if pred_std < 1e-8:
+                            pred += np.random.normal(0, 1e-6, pred.shape)
+                            pred_mean = np.mean(pred)
+                            pred_std = np.std(pred)
+                            if np.isnan(pred_std) or np.isinf(pred_std):
+                                pred_std = 1e-6
+                        if true_std < 1e-8:
+                            true += np.random.normal(0, 1e-6, true.shape)
+                            true_mean = np.mean(true)
+                            true_std = np.std(true)
+                            if np.isnan(true_std) or np.isinf(true_std):
+                                true_std = 1e-6
+                        
+                        if pred_std < 1e-8 or true_std < 1e-8:
+                            ic = 0.0
+                        else:
+                            pred_norm = (pred - pred_mean) / pred_std
+                            true_norm = (true - true_mean) / true_std
+                            ic = np.mean(pred_norm * true_norm)
+                    else:
+                        pred_norm = (pred - pred_mean) / pred_std
+                        true_norm = (true - true_mean) / true_std
+                        ic = np.mean(pred_norm * true_norm)
+                        
+                        if np.isnan(ic) or np.isinf(ic):
+                            ic = 0.0
+                    
+                    ic_list.append(ic)
+                
+                avg_ic = np.mean(ic_list) if ic_list else 0.0
         else:
-            avg_rankic = 0.0
+            avg_ic = 0.0
+            print("验证数据收集失败")
         
-        return avg_loss, avg_rankic
+        return avg_loss, avg_ic
     
-    def train(self, train_loader, val_loader, num_epochs=200):
-        """训练模型 - GPU加速版本，增加epoch上限确保最佳模型保留"""
+    def train(self, train_loader, val_loader, num_epochs=100):
+        """训练模型 - 速度优化版本"""
         print("="*50)
         print("开始训练模型")
         print("="*50)
         
         best_val_loss = float('inf')
-        best_val_rankic = -float('inf')
+        best_val_ic = -float('inf')
         best_model_state = None
         patience_counter = 0
-        patience = 20  # 增加耐心值，给模型更多收敛时间
+        patience = 15  # 进一步减少耐心，更快收敛
+        
+        # 多指标跟踪
+        ic_history = []
+        loss_history = []
+        best_ic_epochs = []
         
         # 记录训练历史
         train_losses = []
         val_losses = []
-        val_rankics = []
+        val_ics = []
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
+            
+            # 设置当前epoch供其他函数使用
+            self.current_epoch = epoch
             
             # 训练
             train_loss = self.train_epoch(train_loader)
             
             # 验证
-            val_loss, val_rankic = self.validate(val_loader)
+            val_loss, val_ic = self.validate(val_loader)
             
             # 记录历史
             train_losses.append(train_loss)
             val_losses.append(val_loss)
-            val_rankics.append(val_rankic)
+            val_ics.append(val_ic)
             
             # 学习率调度
-            self.scheduler.step()
+            if hasattr(self.scheduler, 'step'):
+                try:
+                    self.scheduler.step()
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    print(f"  当前学习率: {current_lr:.2e}")
+                except Exception as e:
+                    print(f"学习率调度器调用失败: {e}")
             
-            print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val RankIC: {val_rankic:.4f}, Best RankIC: {best_val_rankic:.4f}")
+            print(f"Epoch {epoch+1}/{num_epochs}: Loss={train_loss:.4f}/{val_loss:.4f}, IC={val_ic:.4f} (Best: {best_val_ic:.4f})")
             
-            # 改进的早停机制 - 基于RankIC的模型选择（主要指标）
+            # 改进的早停机制
             improved = False
             
-            # 主要指标：RankIC改善时保存模型
-            if val_rankic > best_val_rankic:
-                best_val_rankic = val_rankic
-                best_val_loss = val_loss  # 同时更新验证损失
-                best_model_state = self.model.state_dict().copy()
-                improved = True
-                print(f"✓ 发现更好的RankIC: {best_val_rankic:.6f}")
+            # 记录历史
+            ic_history.append(val_ic)
+            loss_history.append(val_loss)
             
-            # 次要指标：如果验证损失显著改善但RankIC没有恶化太多，也考虑保存
-            elif val_loss < best_val_loss * 0.95 and val_rankic > best_val_rankic * 0.8:
+            # 主要指标：IC改善时保存模型
+            if val_ic > best_val_ic:
+                best_val_ic = val_ic
                 best_val_loss = val_loss
-                best_val_rankic = val_rankic
+                best_model_state = self.model.state_dict().copy()
+                best_ic_epochs.append(epoch)
+                improved = True
+                print(f"发现更好的IC: {best_val_ic:.6f}")
+            
+            # 次要指标：验证损失显著改善但IC没有恶化太多
+            elif val_loss < best_val_loss * 0.98 and val_ic > best_val_ic * 0.9:  # 更严格的条件
+                best_val_loss = val_loss
+                best_val_ic = val_ic
                 best_model_state = self.model.state_dict().copy()
                 improved = True
-                print(f"✓ 验证损失显著改善: {val_loss:.6f} (RankIC: {val_rankic:.6f})")
+                print(f"验证损失显著改善: {val_loss:.6f} (IC: {val_ic:.6f})")
+            
+            # 简化IC趋势检查，减少计算开销
+            if len(ic_history) >= 5 and epoch % 5 == 0:  # 每5个epoch检查一次
+                recent_ic_trend = np.polyfit(range(5), ic_history[-5:], 1)[0]  # 线性趋势
+                if recent_ic_trend > 0:
+                    print(f"IC趋势良好: {recent_ic_trend:.6f}/epoch")
             
             if improved:
                 patience_counter = 0
@@ -694,49 +1023,44 @@ class TransformerFactorTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'scheduler_state_dict': self.scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
-                    'best_val_rankic': best_val_rankic,
+                    'best_val_ic': best_val_ic,
                     'config': self.model_config,
                     'train_losses': train_losses,
                     'val_losses': val_losses,
-                    'val_rankics': val_rankics
+                    'val_ics': val_ics
                 }, 'best_direct_model.pth')
-                print(f"✓ 保存最佳模型，验证损失: {best_val_loss:.6f}, RankIC: {best_val_rankic:.6f}")
+                print(f"  模型已保存 (IC: {best_val_ic:.6f})")
             else:
                 patience_counter += 1
-                print(f"耐心计数: {patience_counter}/{patience}")
                 
-                # 早停条件：连续patience个epoch没有改善
+                # 早停条件
                 if patience_counter >= patience:
-                    print(f"早停触发，最佳验证损失: {best_val_loss:.6f}, 最佳RankIC: {best_val_rankic:.6f}")
-                    print(f"训练了 {epoch+1} 个epoch")
+                    print(f"  早停: 最佳IC={best_val_ic:.6f} (epoch {epoch+1})")
                     
                     # 恢复最佳模型状态
                     if best_model_state is not None:
                         self.model.load_state_dict(best_model_state)
-                        print("✓ 已恢复最佳模型状态")
                     break
             
-            # 额外的早停条件：如果RankIC已经很高，可以提前停止
-            if best_val_rankic > 0.05:  # RankIC > 5%
-                print(f"RankIC已达到较高水平 ({best_val_rankic:.6f})，考虑提前停止")
-                if patience_counter >= patience // 2:  # 减少一半耐心值
-                    print("提前停止训练")
+            # 高IC提前停止
+            if best_val_ic > 0.08:  # 降低阈值
+                if patience_counter >= patience // 2:
+                    print(f"  高IC提前停止: {best_val_ic:.6f}")
                     break
         
-        # 训练结束，确保使用最佳模型
+        # 确保使用最佳模型
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
-            print("✓ 训练结束，使用最佳模型状态")
         
-        return best_val_rankic  # 返回最佳RankIC值
+        print(f"训练完成，最佳IC: {best_val_ic:.6f}")
+        return best_val_ic
     
-    def train_ensemble_models(self, seeds=[123, 456, 789], save_models=True):
-        """训练集成模型 - 严格按照原有逻辑"""
+    def train_ensemble_models(self, seeds=[123, 456, 789], save_models=True, use_cache=True):
+        """训练集成模型"""
         print("="*70)
-        print("多种子集成模型训练 - 减轻随机性干扰")
-        print(f"✓ 训练种子: {seeds}")
-        print(f"✓ 模型数量: {len(seeds)}")
-        print(f"✓ 集成方式: 等权集成")
+        print("多种子集成模型训练")
+        print(f"训练种子: {seeds}")
+        print(f"模型数量: {len(seeds)}")
         print("="*70)
         
         # 创建保存目录
@@ -747,10 +1071,10 @@ class TransformerFactorTrainer:
         models_info = []
         trained_models = []
         
-        # 加载数据（只需要加载一次）
+        # 加载数据
         data = self.load_direct_data()
         if data is None:
-            print("✗ 数据加载失败")
+            print("数据加载失败")
             return None
         
         features_df, stock_data = data
@@ -760,7 +1084,8 @@ class TransformerFactorTrainer:
         
         train_loader, val_loader, scaler = self.create_data_loaders(
             (features, labels, dates), 
-            batch_size=self.model_config['training_params']['batch_size']
+            batch_size=self.batch_size,
+            use_cache=use_cache
         )
         
         # 训练多个模型
@@ -776,24 +1101,47 @@ class TransformerFactorTrainer:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
             
-            # 重新初始化模型（确保每个模型都是独立的）
-            model = TransformerSeq2SeqModel(**self.model_config['model_params'])
+            # 重新初始化模型
+            model = TransformerSeq2SeqModel(**self.model_config)
             model.to(self.device)
+            
+            # 改进的权重初始化
+            output_layers = 0
+            other_layers = 0
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    if 'fc_out' in name:
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)  # 使用与训练器相同的初始化
+                        output_layers += 1
+                    else:
+                        torch.nn.init.xavier_uniform_(module.weight, gain=0.8)  # 适中的其他层gain
+                        other_layers += 1
+                    if module.bias is not None:
+                        torch.nn.init.zeros_(module.bias)
+                elif isinstance(module, torch.nn.LayerNorm):
+                    torch.nn.init.ones_(module.weight)
+                    torch.nn.init.zeros_(module.bias)
             
             # 确保所有参数都需要梯度
             for param in model.parameters():
                 param.requires_grad = True
             
+            print(f"模型 {i+1} 权重初始化完成: 输出层{output_layers}个, 其他层{other_layers}个")
+            
             # 重新初始化优化器和调度器
             optimizer = torch.optim.AdamW(
                 model.parameters(),
-                lr=self.model_config['training_params']['learning_rate'],
-                weight_decay=self.model_config['training_params']['weight_decay']
+                lr=5e-5,  # 使用与训练器相同的学习率
+                weight_decay=1e-3,  # 使用与训练器相同的权重衰减
+                betas=(0.9, 0.999),
+                eps=1e-8
             )
             
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
-                T_max=self.model_config['training_params']['num_epochs']
+                T_0=20,
+                T_mult=2,
+                eta_min=1e-6
             )
             
             # 临时保存原始配置
@@ -807,21 +1155,21 @@ class TransformerFactorTrainer:
             self.scheduler = scheduler
             
             # 训练模型
-            best_rankic = self.train(
+            best_ic = self.train(
                 train_loader, val_loader, 
-                num_epochs=self.model_config['training_params']['num_epochs']
+                num_epochs=self.num_epochs  # 使用训练器的epoch数量
             )
             
             # 保存模型信息
             model_info = {
                 'model_id': i + 1,
                 'seed': seed,
-                'best_rankic': best_rankic,
+                'best_ic': float(best_ic),
                 'config': self.model_config.copy()
             }
             models_info.append(model_info)
             
-            # 保存模型到CPU（节省GPU内存）
+            # 保存模型到CPU
             trained_models.append(self.model.cpu().state_dict())
             
             # 保存单个模型文件
@@ -831,15 +1179,11 @@ class TransformerFactorTrainer:
                     'epoch': 'final',
                     'model_state_dict': self.model.state_dict(),
                     'model_info': model_info,
-                    'config': self.model_config,
-                    'scaler_params': {
-                        'mean': scaler.mean_,
-                        'scale': scaler.scale_
-                    }
+                    'config': self.model_config
                 }, model_file)
-                print(f"✓ 模型已保存: {model_file}")
+                print(f"模型已保存: {model_file}")
             
-            print(f"✓ 第 {i+1} 个模型训练完成，最佳RankIC: {best_rankic:.6f}")
+                print(f"模型 {i+1}/{len(seeds)} 完成，最佳IC: {best_ic:.6f}")
             
             # 恢复原始配置
             self.model = original_model
@@ -859,160 +1203,74 @@ class TransformerFactorTrainer:
             with open('trained_models/ensemble_info.json', 'w') as f:
                 json.dump(ensemble_info, f, indent=4)
             
-            print(f"✓ 集成信息已保存: trained_models/ensemble_info.json")
+            print(f"集成信息已保存: trained_models/ensemble_info.json")
         
-        print(f"\n{'='*70}")
-        print("多种子集成模型训练完成!")
-        print(f"✓ 成功训练 {len(trained_models)} 个模型")
-        avg_rankic = np.mean([info['best_rankic'] for info in models_info])
-        print(f"✓ 平均最佳RankIC: {avg_rankic:.6f}")
-        print(f"✓ RankIC标准差: {np.std([info['best_rankic'] for info in models_info]):.6f}")
-        print("="*70)
+        print(f"\n{'='*50}")
+        print("集成训练完成!")
+        avg_ic = np.mean([info['best_ic'] for info in models_info])
+        print(f"{len(trained_models)}个模型，平均IC: {avg_ic:.6f}")
+        print("="*50)
+        
+        # 计算统计信息
+        avg_ic = np.mean([info['best_ic'] for info in models_info])
+        best_ic = max([info['best_ic'] for info in models_info])
         
         return {
             'models_info': models_info,
             'trained_models': trained_models,
-            'scaler': scaler
+            'scaler': scaler,
+            'avg_ic': avg_ic,
+            'best_ic': best_ic,
+            'num_models': len(seeds)
         }
 
 def main():
-    """主函数 - 多种子集成因子训练"""
+    """主函数 - 优化版本"""
+    print("="*60)
+    print("Transformer因子训练 - 优化版本")
+    print("="*60)
     
-    # 命令行参数解析
-    parser = argparse.ArgumentParser(description='Transformer因子训练 - 直接数据版本')
-    parser.add_argument('--mode', choices=['train', 'backtest', 'full'], default='full',
-                      help='运行模式: train(仅训练), backtest(仅回测), full(完整流程)')
-    parser.add_argument('--seeds', nargs='+', type=int, default=[123, 456, 789],
-                      help='随机数种子列表')
-    parser.add_argument('--epochs', type=int, default=200,
-                      help='训练轮数 (默认200，确保充分训练)')
-    parser.add_argument('--fast', action='store_true',
-                      help='快速训练模式：减少模型复杂度，增大batch_size')
-    parser.add_argument('--max_stocks', type=int, default=500,
-                      help='最大训练股票数量 (默认500只)')
-    parser.add_argument('--ultra_fast', action='store_true',
-                      help='超快训练模式：仅使用10只股票进行训练')
+    # 检查GPU内存
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU内存: {gpu_memory:.1f} GB")
+        
+        if gpu_memory < 20:
+            print("GPU内存不足，建议使用更小的模型配置")
     
-    try:
-        args = parser.parse_args()
-    except:
-        # 如果没有命令行参数，使用默认值
-        class Args:
-            mode = 'full'
-            seeds = [123, 456, 789]
-            epochs = 200
-            fast = False
-            max_stocks = 500
-            ultra_fast = False
-        args = Args()
-    
-    # 处理超快训练模式
-    if args.ultra_fast:
-        args.max_stocks = 10
-        args.fast = True
-        print("✓ 超快训练模式已启用：10只股票 + 快速训练配置")
-    
-    print("Transformer因子合成训练 - 直接数据版本")
-    print("="*80)
-    print("技术规格:")
-    print("✓ 特征X: 个股过去40个交易日的6大因子数据 (OHLC+VWAP+Amount)")
-    print("✓ 标签y: 个股未来10个交易日（T+1～T+11）的收益率")
-    print("✓ 训练数据: 从2013年开始，每5个交易日采样一次")
-    print("✓ 数据划分: 训练集和验证集依时间先后按照4:1比例划分")
-    print("✓ 损失函数: 预测值与标签之间IC的相反数")
-    print("✓ 集成策略: 3个不同种子模型等权集成，减轻随机性干扰")
-    print("✓ GPU加速: 充分利用RTX 4090进行训练")
-    print("="*80)
-    print(f"运行模式: {args.mode}")
-    print(f"随机数种子: {args.seeds}")
-    print(f"快速模式: {'是' if args.fast else '否'}")
-    print(f"最大股票数量: {args.max_stocks if args.max_stocks else '无限制'}")
-    if args.ultra_fast:
-        print("⚡ 超快训练模式: 10只股票 + 快速配置")
-    print("="*80)
-    
-    # 模型配置 - 根据模式选择
-    if args.fast:
-        # 超高速训练配置 - 充分利用RTX 4090的24GB显存
+            # 速度优化后的模型配置
         model_config = {
-            'model_params': {
-                'input_dim': 6,
-                'd_model': 128,           # 保持标准维度
-                'nhead': 8,               # 保持标准头数
-                'num_layers': 3,          # 保持标准层数
-                'dim_feedforward': 512,   # 保持标准FF维度
-                'dropout': 0.1,
-                'label_horizon': 10
-            },
-            'training_params': {
-                'learning_rate': 1e-4,    # 降低学习率，提高训练稳定性
-                'weight_decay': 1e-4,
-                'batch_size': 2048,       # 超大批量，充分利用24GB显存
-                'num_epochs': 100         # 增加训练轮数，确保充分训练
-            }
+            'input_dim': 6,
+            'd_model': 192,        # 从256减小到192，平衡速度和性能
+            'nhead': 12,           # 从16减小到12
+            'num_layers': 4,       # 从6减小到4
+            'dim_feedforward': 768,   # 从1024减小到768
+            'dropout': 0.1,
+            'label_horizon': 10
         }
-        print("使用超高速训练配置:")
-        print("✓ 模型维度: 128 (标准)")
-        print("✓ 注意力头数: 8 (标准)")
-        print("✓ 层数: 3 (标准)")
-        print("✓ 批大小: 2048 (超大批量) - 充分利用RTX 4090")
-        print("✓ 训练轮数: 100 (确保充分训练)")
-        print("✓ 学习率: 5e-4 (加速收敛)")
-        print("✓ 早停机制: 改进版，基于IC优化")
+    
+    print(f"模型配置: {model_config}")
+    
+    # 创建训练器
+    trainer = TransformerFactorTrainer(model_config, max_stocks=None)
+    
+    # 训练集成模型
+    print("\n开始训练集成模型...")
+    ensemble_info = trainer.train_ensemble_models(
+        seeds=[123, 456, 789],  # 3个模型
+        save_models=True,
+        use_cache=True
+    )
+    
+    if ensemble_info:
+        print("\n集成训练完成!")
+        print(f"平均IC: {ensemble_info['avg_ic']:.6f}")
+        print(f"最佳IC: {ensemble_info['best_ic']:.6f}")
+        print(f"模型数量: {ensemble_info['num_models']}")
     else:
-        # 超高性能配置 - 针对IC优化
-        model_config = {
-            'model_params': {
-                'input_dim': 6,           # 6大基本特征
-                'd_model': 256,           # 适中的模型维度
-                'nhead': 8,               # 适中的注意力头数
-                'num_layers': 4,          # 适中的层数
-                'dim_feedforward': 1024,  # 适中的FF维度
-                'dropout': 0.1,           # 适中的dropout
-                'label_horizon': 10
-            },
-            'training_params': {
-                'learning_rate': 5e-5,    # 较低的学习率，提高稳定性
-                'weight_decay': 1e-4,     # 适中的权重衰减
-                'batch_size': 2048,       # 大批量，提高稳定性
-                'num_epochs': args.epochs
-            }
-        }
-        print("使用超高性能配置:")
-        print("✓ 模型维度: 256 (高性能)")
-        print("✓ 注意力头数: 16 (高性能)")
-        print("✓ 层数: 4 (高性能)")
-        print("✓ 批大小: 2048 (超大批量) - 充分利用RTX 4090")
-        print("✓ 训练轮数: 200 (充分训练)")
-        print("✓ 早停机制: 改进版，基于IC优化")
-        print("✓ 混合精度训练: 启用")
-        print("✓ TF32加速: 启用")
-        print("✓ CUDA优化: 启用")
+        print("\n训练失败!")
     
-    # 初始化训练器
-    trainer = TransformerFactorTrainer(model_config, max_stocks=args.max_stocks)
-    
-    if args.mode in ['train', 'full']:
-        print("\n" + "="*60)
-        print("阶段1: 多种子集成模型训练")
-        print("="*60)
-        
-        # 训练集成模型
-        ensemble_result = trainer.train_ensemble_models(
-            seeds=args.seeds, 
-            save_models=True
-        )
-        
-        if ensemble_result is None:
-            print("✗ 集成模型训练失败")
-            return
-        
-        print(f"\n✓ 集成模型训练完成！")
-        print(f"✓ 平均最佳RankIC: {np.mean([info['best_rankic'] for info in ensemble_result['models_info']]):.6f}")
-    
-    print("\n" + "="*80)
-    print("训练流程完成！")
-    print("="*80)
+    print("\n" + "="*60)
 
 if __name__ == "__main__":
     main() 

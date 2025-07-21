@@ -3,67 +3,43 @@
         {
             "model_id": 1,
             "seed": 123,
-            "best_ic": 0.15720419077860198,
+            "best_ic": 0.06507300585508347,
             "config": {
-                "model_params": {
-                    "input_dim": 6,
-                    "d_model": 256,
-                    "nhead": 16,
-                    "num_layers": 4,
-                    "dim_feedforward": 1024,
-                    "dropout": 0.1,
-                    "label_horizon": 10
-                },
-                "training_params": {
-                    "learning_rate": 0.0003,
-                    "weight_decay": 0.0001,
-                    "batch_size": 2048,
-                    "num_epochs": 200
-                }
+                "input_dim": 6,
+                "d_model": 192,
+                "nhead": 12,
+                "num_layers": 4,
+                "dim_feedforward": 768,
+                "dropout": 0.1,
+                "label_horizon": 10
             }
         },
         {
             "model_id": 2,
             "seed": 456,
-            "best_ic": 0.14230883429490176,
+            "best_ic": 0.06857184320688248,
             "config": {
-                "model_params": {
-                    "input_dim": 6,
-                    "d_model": 256,
-                    "nhead": 16,
-                    "num_layers": 4,
-                    "dim_feedforward": 1024,
-                    "dropout": 0.1,
-                    "label_horizon": 10
-                },
-                "training_params": {
-                    "learning_rate": 0.0003,
-                    "weight_decay": 0.0001,
-                    "batch_size": 2048,
-                    "num_epochs": 200
-                }
+                "input_dim": 6,
+                "d_model": 192,
+                "nhead": 12,
+                "num_layers": 4,
+                "dim_feedforward": 768,
+                "dropout": 0.1,
+                "label_horizon": 10
             }
         },
         {
             "model_id": 3,
             "seed": 789,
-            "best_ic": 0.14931160583281478,
+            "best_ic": 0.06979993730783463,
             "config": {
-                "model_params": {
-                    "input_dim": 6,
-                    "d_model": 256,
-                    "nhead": 16,
-                    "num_layers": 4,
-                    "dim_feedforward": 1024,
-                    "dropout": 0.1,
-                    "label_horizon": 10
-                },
-                "training_params": {
-                    "learning_rate": 0.0003,
-                    "weight_decay": 0.0001,
-                    "batch_size": 2048,
-                    "num_epochs": 200
-                }
+                "input_dim": 6,
+                "d_model": 192,
+                "nhead": 12,
+                "num_layers": 4,
+                "dim_feedforward": 768,
+                "dropout": 0.1,
+                "label_horizon": 10
             }
         }
     ],
@@ -74,5 +50,5 @@
         456,
         789
     ],
-    "training_date": "2025-07-08T13:12:22.407615"
+    "training_date": "2025-07-21T14:20:17.382226"
 }

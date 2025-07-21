@@ -1,0 +1,24 @@
+{
+    "analysis_summary": {
+        "train_ic": 0.1497748704411262,
+        "backtest_ic": 0.19886803041765236,
+        "ic_difference": -0.04909315997652616,
+        "difference_percentage": 32.777968581734676
+    },
+    "sample_size_analysis": {
+        "train_samples": 20480,
+        "backtest_samples": 2400,
+        "sample_ratio": 8.533333333333333
+    },
+    "calculation_methods": {
+        "train_method": "跨时间混合计算，包含时间序列相关性",
+        "backtest_method": "纯截面计算，时间独立"
+    },
+    "recommendations": [
+        "增加回测样本量和时间跨度",
+        "改进IC计算方法，使用滚动窗口",
+        "优化特征工程，消除前瞻性偏差",
+        "调整模型结构，减少过拟合",
+        "完善回测框架，更接近实际交易"
+    ]
+}
